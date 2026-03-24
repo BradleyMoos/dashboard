@@ -2,38 +2,56 @@ const express = require('express');
 const UAParser = require('ua-parser-js');
 const QRCode = require('qrcode');
 const path = require('path');
-const fs = require('fs');
+const mysql = require('mysql2/promise');
 
 const router = express.Router();
 
-const DATA_DIR = path.join(__dirname, 'data');
-const DB_FILE = path.join(DATA_DIR, 'data.json');
-
-if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
-
 const TRACKING_BASE = process.env.QR_TRACKING_BASE || 'https://dashboard.bradleymoos.com/qr-tracker';
 
-// ─── DB ───────────────────────────────────────────────────────────────────────
-function loadDB() {
-  if (!fs.existsSync(DB_FILE)) {
-    const initial = { qr_codes: [], scans: [] };
-    fs.writeFileSync(DB_FILE, JSON.stringify(initial, null, 2));
-    return initial;
-  }
-  return JSON.parse(fs.readFileSync(DB_FILE, 'utf8'));
+// ─── Database ─────────────────────────────────────────────────────────────────
+const pool = mysql.createPool({
+  host:     process.env.DB_HOST     || 'localhost',
+  user:     process.env.DB_USER     || 'u522090863_dashboard',
+  password: process.env.DB_PASSWORD || 'Us*!UfKi6bRUYK',
+  database: process.env.DB_NAME     || 'u522090863_dashboard',
+  waitForConnections: true,
+  connectionLimit: 10
+});
+
+async function initDB() {
+  await pool.execute(`
+    CREATE TABLE IF NOT EXISTS qr_codes (
+      id VARCHAR(100) PRIMARY KEY,
+      label VARCHAR(255) NOT NULL,
+      client VARCHAR(255) DEFAULT '',
+      redirect_url TEXT NOT NULL,
+      created_at DATETIME NOT NULL
+    )
+  `);
+  await pool.execute(`
+    CREATE TABLE IF NOT EXISTS scans (
+      id BIGINT PRIMARY KEY,
+      qr_id VARCHAR(100) NOT NULL,
+      scanned_at DATETIME NOT NULL,
+      ip VARCHAR(100) DEFAULT '',
+      user_agent TEXT DEFAULT '',
+      device_type VARCHAR(50) DEFAULT 'desktop',
+      browser VARCHAR(100) DEFAULT 'Unknown',
+      os VARCHAR(100) DEFAULT 'Unknown',
+      referrer TEXT DEFAULT ''
+    )
+  `);
 }
 
-function saveDB(data) {
-  fs.writeFileSync(DB_FILE, JSON.stringify(data, null, 2));
-}
+initDB().catch(err => console.error('DB init fout:', err));
 
 // ─── Routes ───────────────────────────────────────────────────────────────────
 router.get('/', (req, res) => res.redirect(req.baseUrl + '/admin'));
 
-router.get('/track/:id', (req, res) => {
-  const db = loadDB();
-  const qr = db.qr_codes.find(q => q.id === req.params.id);
-  if (!qr) return res.status(404).send('QR code niet gevonden.');
+router.get('/track/:id', async (req, res) => {
+  const [rows] = await pool.execute('SELECT * FROM qr_codes WHERE id = ?', [req.params.id]);
+  if (rows.length === 0) return res.status(404).send('QR code niet gevonden.');
+  const qr = rows[0];
 
   const ua = req.headers['user-agent'] || '';
   const result = new UAParser(ua).getResult();
@@ -41,25 +59,18 @@ router.get('/track/:id', (req, res) => {
     || req.headers['x-real-ip']
     || req.socket.remoteAddress;
 
-  db.scans.push({
-    id: Date.now(),
-    qr_id: req.params.id,
-    scanned_at: new Date().toISOString(),
-    ip,
-    user_agent: ua,
-    device_type: result.device.type || 'desktop',
-    browser: result.browser.name || 'Unknown',
-    os: result.os.name || 'Unknown',
-    referrer: req.headers['referer'] || ''
-  });
-  saveDB(db);
+  await pool.execute(
+    'INSERT INTO scans (id, qr_id, scanned_at, ip, user_agent, device_type, browser, os, referrer) VALUES (?,?,NOW(),?,?,?,?,?,?)',
+    [Date.now(), qr.id, ip, ua, result.device.type || 'desktop', result.browser.name || 'Unknown', result.os.name || 'Unknown', req.headers['referer'] || '']
+  );
+
   const dest = /^https?:\/\//i.test(qr.redirect_url) ? qr.redirect_url : 'https://' + qr.redirect_url;
   res.redirect(302, dest);
 });
 
-router.get('/admin', (req, res) => {
-  const db = loadDB();
-  res.send(adminPage(req.baseUrl, db.qr_codes, req.query.msg));
+router.get('/admin', async (req, res) => {
+  const [qrCodes] = await pool.execute('SELECT * FROM qr_codes ORDER BY created_at DESC');
+  res.send(adminPage(req.baseUrl, qrCodes, req.query.msg));
 });
 
 router.post('/admin/create', async (req, res) => {
@@ -67,61 +78,64 @@ router.post('/admin/create', async (req, res) => {
   if (!id || !label || !redirect_url) return res.redirect(req.baseUrl + '/admin?msg=Vul alle velden in.');
   if (!/^[a-z0-9-]+$/.test(id)) return res.redirect(req.baseUrl + '/admin?msg=ID mag alleen kleine letters, cijfers en koppeltekens bevatten.');
 
-  const db = loadDB();
-  if (db.qr_codes.find(q => q.id === id)) return res.redirect(req.baseUrl + `/admin?msg=ID "${id}" bestaat al.`);
+  const [existing] = await pool.execute('SELECT id FROM qr_codes WHERE id = ?', [id]);
+  if (existing.length > 0) return res.redirect(req.baseUrl + `/admin?msg=ID "${id}" bestaat al.`);
 
-  db.qr_codes.push({ id, label, client: client || '', redirect_url, created_at: new Date().toISOString() });
-  saveDB(db);
+  await pool.execute(
+    'INSERT INTO qr_codes (id, label, client, redirect_url, created_at) VALUES (?,?,?,?,NOW())',
+    [id, label, client || '', redirect_url]
+  );
 
   const trackingUrl = `${TRACKING_BASE}/track/${id}`;
-  await QRCode.toFile(path.join(DATA_DIR, `qr-${id}.png`), trackingUrl, {
+  const qrBuffer = await QRCode.toBuffer(trackingUrl, {
     errorCorrectionLevel: 'H', width: 600, margin: 3,
     color: { dark: '#111827', light: '#ffffff' }
   });
 
-  res.redirect(req.baseUrl + `/admin?msg=QR code "${label}" aangemaakt!`);
+  res.redirect(req.baseUrl + `/admin?msg=QR code "${label}" aangemaakt!&qrbuffer=${encodeURIComponent(qrBuffer.toString('base64'))}&qrid=${id}`);
 });
 
-router.post('/admin/delete/:id', (req, res) => {
-  const db = loadDB();
-  db.qr_codes = db.qr_codes.filter(q => q.id !== req.params.id);
-  db.scans = db.scans.filter(s => s.qr_id !== req.params.id);
-  saveDB(db);
-  const file = path.join(DATA_DIR, `qr-${req.params.id}.png`);
-  if (fs.existsSync(file)) fs.unlinkSync(file);
+router.post('/admin/delete/:id', async (req, res) => {
+  await pool.execute('DELETE FROM scans WHERE qr_id = ?', [req.params.id]);
+  await pool.execute('DELETE FROM qr_codes WHERE id = ?', [req.params.id]);
   res.redirect(req.baseUrl + '/admin?msg=QR code verwijderd.');
 });
 
-router.get('/admin/qr/:id', (req, res) => {
-  const file = path.join(DATA_DIR, `qr-${req.params.id}.png`);
-  if (fs.existsSync(file)) {
-    res.setHeader('Content-Disposition', `attachment; filename="qr-${req.params.id}.png"`);
-    res.sendFile(file);
-  } else {
-    res.redirect(req.baseUrl + '/admin?msg=QR afbeelding niet gevonden.');
-  }
+router.get('/admin/qr/:id', async (req, res) => {
+  const [rows] = await pool.execute('SELECT * FROM qr_codes WHERE id = ?', [req.params.id]);
+  if (rows.length === 0) return res.redirect(req.baseUrl + '/admin?msg=QR code niet gevonden.');
+
+  const trackingUrl = `${TRACKING_BASE}/track/${req.params.id}`;
+  const qrBuffer = await QRCode.toBuffer(trackingUrl, {
+    errorCorrectionLevel: 'H', width: 600, margin: 3,
+    color: { dark: '#111827', light: '#ffffff' }
+  });
+
+  res.setHeader('Content-Type', 'image/png');
+  res.setHeader('Content-Disposition', `attachment; filename="qr-${req.params.id}.png"`);
+  res.send(qrBuffer);
 });
 
-router.get('/stats', (req, res) => {
-  const db = loadDB();
-  if (db.qr_codes.length === 0) {
+router.get('/stats', async (req, res) => {
+  const [qrCodes] = await pool.execute('SELECT * FROM qr_codes ORDER BY created_at DESC');
+  if (qrCodes.length === 0) {
     return res.send(`<p style="font-family:sans-serif;padding:40px">Nog geen QR codes. <a href="${req.baseUrl}/admin">Ga naar admin</a>.</p>`);
   }
-  const selectedId = req.query.qr || db.qr_codes[0].id;
-  const qr = db.qr_codes.find(q => q.id === selectedId);
-  const allScans = db.scans.filter(s => s.qr_id === selectedId);
-  const recentScans = [...allScans].sort((a, b) => new Date(b.scanned_at) - new Date(a.scanned_at)).slice(0, 200);
+
+  const selectedId = req.query.qr || qrCodes[0].id;
+  const qr = qrCodes.find(q => q.id === selectedId);
+  const [allScans] = await pool.execute('SELECT * FROM scans WHERE qr_id = ? ORDER BY scanned_at DESC', [selectedId]);
 
   const today = new Date().toISOString().slice(0, 10);
   const dayMap = {};
-  allScans.forEach(s => { const d = s.scanned_at.slice(0, 10); dayMap[d] = (dayMap[d] || 0) + 1; });
+  allScans.forEach(s => { const d = new Date(s.scanned_at).toISOString().slice(0, 10); dayMap[d] = (dayMap[d] || 0) + 1; });
   const perDay = Object.entries(dayMap).sort((a, b) => a[0].localeCompare(b[0])).slice(-30);
   const deviceMap = {};
   allScans.forEach(s => { const d = s.device_type || 'desktop'; deviceMap[d] = (deviceMap[d] || 0) + 1; });
 
   res.send(statsPage(req.baseUrl, {
-    qrCodes: db.qr_codes, selectedId, qr,
-    scans: recentScans,
+    qrCodes, selectedId, qr,
+    scans: allScans.slice(0, 200),
     total: allScans.length,
     todayCount: dayMap[today] || 0,
     avgPerDay: perDay.length ? Math.round(perDay.reduce((a, b) => a + b[1], 0) / perDay.length) : 0,
@@ -129,7 +143,6 @@ router.get('/stats', (req, res) => {
     perDay, deviceMap
   }));
 });
-
 
 // ─── HTML ─────────────────────────────────────────────────────────────────────
 function adminPage(base, qrCodes, msg) {
@@ -205,7 +218,7 @@ function adminPage(base, qrCodes, msg) {
         </div>
         <div class="form-group">
           <label>Doorstuur URL</label>
-          <input type="url" name="redirect_url" placeholder="https://..." required>
+          <input type="text" name="redirect_url" placeholder="https://..." required>
         </div>
       </div>
       <div style="margin-top:16px">
