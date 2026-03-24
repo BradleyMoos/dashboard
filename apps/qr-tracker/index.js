@@ -12,7 +12,6 @@ const DB_FILE = path.join(DATA_DIR, 'data.json');
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 
 const TRACKING_BASE = process.env.QR_TRACKING_BASE || 'https://dashboard.bradleymoos.com/qr-tracker';
-const ADMIN_PASSWORD = process.env.QR_ADMIN_PASSWORD || 'changeme';
 
 // ─── DB ───────────────────────────────────────────────────────────────────────
 function loadDB() {
@@ -28,36 +27,8 @@ function saveDB(data) {
   fs.writeFileSync(DB_FILE, JSON.stringify(data, null, 2));
 }
 
-// ─── Auth ─────────────────────────────────────────────────────────────────────
-const sessions = new Set();
-
-function authMiddleware(req, res, next) {
-  const token = req.headers.cookie?.match(/qr_session=([^;]+)/)?.[1];
-  if (sessions.has(token)) return next();
-  res.redirect(req.baseUrl + '/admin/login');
-}
-
 // ─── Routes ───────────────────────────────────────────────────────────────────
 router.get('/', (req, res) => res.redirect(req.baseUrl + '/stats'));
-
-router.get('/admin/login', (req, res) => res.send(loginPage(req.baseUrl, '')));
-
-router.post('/admin/login', (req, res) => {
-  if (req.body.password === ADMIN_PASSWORD) {
-    const token = Math.random().toString(36).slice(2) + Date.now().toString(36);
-    sessions.add(token);
-    res.setHeader('Set-Cookie', `qr_session=${token}; Path=${req.baseUrl}; HttpOnly`);
-    res.redirect(req.baseUrl + '/admin');
-  } else {
-    res.send(loginPage(req.baseUrl, 'Fout wachtwoord, probeer opnieuw.'));
-  }
-});
-
-router.get('/admin/logout', (req, res) => {
-  const token = req.headers.cookie?.match(/qr_session=([^;]+)/)?.[1];
-  sessions.delete(token);
-  res.redirect(req.baseUrl + '/admin/login');
-});
 
 router.get('/track/:id', (req, res) => {
   const db = loadDB();
@@ -85,12 +56,12 @@ router.get('/track/:id', (req, res) => {
   res.redirect(302, qr.redirect_url);
 });
 
-router.get('/admin', authMiddleware, (req, res) => {
+router.get('/admin', (req, res) => {
   const db = loadDB();
   res.send(adminPage(req.baseUrl, db.qr_codes, req.query.msg));
 });
 
-router.post('/admin/create', authMiddleware, async (req, res) => {
+router.post('/admin/create', async (req, res) => {
   const { id, label, client, redirect_url } = req.body;
   if (!id || !label || !redirect_url) return res.redirect(req.baseUrl + '/admin?msg=Vul alle velden in.');
   if (!/^[a-z0-9-]+$/.test(id)) return res.redirect(req.baseUrl + '/admin?msg=ID mag alleen kleine letters, cijfers en koppeltekens bevatten.');
@@ -110,7 +81,7 @@ router.post('/admin/create', authMiddleware, async (req, res) => {
   res.redirect(req.baseUrl + `/admin?msg=QR code "${label}" aangemaakt!`);
 });
 
-router.post('/admin/delete/:id', authMiddleware, (req, res) => {
+router.post('/admin/delete/:id', (req, res) => {
   const db = loadDB();
   db.qr_codes = db.qr_codes.filter(q => q.id !== req.params.id);
   db.scans = db.scans.filter(s => s.qr_id !== req.params.id);
@@ -120,7 +91,7 @@ router.post('/admin/delete/:id', authMiddleware, (req, res) => {
   res.redirect(req.baseUrl + '/admin?msg=QR code verwijderd.');
 });
 
-router.get('/admin/qr/:id', authMiddleware, (req, res) => {
+router.get('/admin/qr/:id', (req, res) => {
   const file = path.join(DATA_DIR, `qr-${req.params.id}.png`);
   if (fs.existsSync(file)) {
     res.setHeader('Content-Disposition', `attachment; filename="qr-${req.params.id}.png"`);
@@ -130,7 +101,7 @@ router.get('/admin/qr/:id', authMiddleware, (req, res) => {
   }
 });
 
-router.get('/stats', authMiddleware, (req, res) => {
+router.get('/stats', (req, res) => {
   const db = loadDB();
   if (db.qr_codes.length === 0) {
     return res.send(`<p style="font-family:sans-serif;padding:40px">Nog geen QR codes. <a href="${req.baseUrl}/admin">Ga naar admin</a>.</p>`);
@@ -158,45 +129,8 @@ router.get('/stats', authMiddleware, (req, res) => {
   }));
 });
 
-// ─── HTML ─────────────────────────────────────────────────────────────────────
-function loginPage(base, error) {
-  return `<!DOCTYPE html>
-<html lang="nl">
-<head>
-  <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Login — QR Tracker</title>
-  <style>
-    *{box-sizing:border-box;margin:0;padding:0}
-    body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#f1f5f9;display:flex;align-items:center;justify-content:center;min-height:100vh}
-    .card{background:white;border-radius:16px;padding:40px;width:100%;max-width:380px;box-shadow:0 4px 24px rgba(0,0,0,.08)}
-    .logo{font-size:1.5rem;font-weight:800;color:#111827;margin-bottom:4px}.logo span{color:#6366f1}
-    .sub{color:#6b7280;font-size:.9rem;margin-bottom:28px}
-    label{display:block;font-weight:600;font-size:.82rem;color:#374151;margin-bottom:6px}
-    input{width:100%;padding:10px 14px;border:1.5px solid #e5e7eb;border-radius:8px;font-size:1rem}
-    input:focus{outline:none;border-color:#6366f1}
-    button{margin-top:16px;width:100%;padding:12px;background:#6366f1;color:white;border:none;border-radius:8px;font-size:.95rem;font-weight:600;cursor:pointer}
-    button:hover{background:#4f46e5}
-    .error{margin-top:12px;color:#ef4444;font-size:.85rem;text-align:center}
-    .back{display:block;margin-top:16px;text-align:center;font-size:.82rem;color:#6b7280;text-decoration:none}
-    .back:hover{color:#6366f1}
-  </style>
-</head>
-<body>
-  <div class="card">
-    <div class="logo">QR<span>Tracker</span></div>
-    <p class="sub">Admin toegang</p>
-    <form method="POST" action="${base}/admin/login">
-      <label for="pw">Wachtwoord</label>
-      <input type="password" id="pw" name="password" autofocus required>
-      <button type="submit">Inloggen</button>
-      ${error ? `<div class="error">${error}</div>` : ''}
-    </form>
-    <a class="back" href="/">← Terug naar dashboard</a>
-  </div>
-</body>
-</html>`;
-}
 
+// ─── HTML ─────────────────────────────────────────────────────────────────────
 function adminPage(base, qrCodes, msg) {
   const grouped = {};
   qrCodes.forEach(q => {
@@ -247,7 +181,7 @@ function adminPage(base, qrCodes, msg) {
   <div class="nav">
     <a href="/">← Dashboard</a>
     <a href="${base}/stats">Stats</a>
-    <a href="${base}/admin/logout">Uitloggen</a>
+    <a href="/logout">Uitloggen</a>
   </div>
 </header>
 <div class="container">
