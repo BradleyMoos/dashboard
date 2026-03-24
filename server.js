@@ -39,7 +39,10 @@ function authMiddleware(req, res, next) {
 // ─── Beveiligde routes ────────────────────────────────────────────────────────
 app.get('/', authMiddleware, (req, res) => res.sendFile(path.join(__dirname, 'index.html')));
 
-app.use('/qr-tracker', authMiddleware, require('./apps/qr-tracker'));
+app.use('/qr-tracker', (req, res, next) => {
+  if (req.path.startsWith('/track/')) return next(); // publiek: iedereen mag scannen
+  authMiddleware(req, res, next);
+}, require('./apps/qr-tracker'));
 
 // ─── Start ────────────────────────────────────────────────────────────────────
 app.listen(PORT, () => {
