@@ -53,7 +53,8 @@ router.get('/track/:id', (req, res) => {
     referrer: req.headers['referer'] || ''
   });
   saveDB(db);
-  res.redirect(302, qr.redirect_url);
+  const dest = /^https?:\/\//i.test(qr.redirect_url) ? qr.redirect_url : 'https://' + qr.redirect_url;
+  res.redirect(302, dest);
 });
 
 router.get('/admin', (req, res) => {
