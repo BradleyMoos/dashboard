@@ -9,7 +9,7 @@ const TRACKING_BASE = process.env.QR_TRACKING_BASE || 'https://dashboard.bradley
 
 // ─── Database ─────────────────────────────────────────────────────────────────
 const pool = mysql.createPool({
-  host:     process.env.DB_HOST     || 'localhost',
+  host:     process.env.DB_HOST     || '127.0.0.1',
   user:     process.env.DB_USER     || 'u522090863_dashboard',
   password: process.env.DB_PASSWORD || 'Us*!UfKi6bRUYK',
   database: process.env.DB_NAME     || 'u522090863_dashboard',
