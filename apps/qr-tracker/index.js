@@ -28,7 +28,7 @@ function saveDB(data) {
 }
 
 // ─── Routes ───────────────────────────────────────────────────────────────────
-router.get('/', (req, res) => res.redirect(req.baseUrl + '/stats'));
+router.get('/', (req, res) => res.redirect(req.baseUrl + '/admin'));
 
 router.get('/track/:id', (req, res) => {
   const db = loadDB();
