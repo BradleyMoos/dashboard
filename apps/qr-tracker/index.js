@@ -1,7 +1,6 @@
 const express = require('express');
 const UAParser = require('ua-parser-js');
 const QRCode = require('qrcode');
-const path = require('path');
 const mysql = require('mysql2/promise');
 
 const router = express.Router();
@@ -86,13 +85,7 @@ router.post('/admin/create', async (req, res) => {
     [id, label, client || '', redirect_url]
   );
 
-  const trackingUrl = `${TRACKING_BASE}/track/${id}`;
-  const qrBuffer = await QRCode.toBuffer(trackingUrl, {
-    errorCorrectionLevel: 'H', width: 600, margin: 3,
-    color: { dark: '#111827', light: '#ffffff' }
-  });
-
-  res.redirect(req.baseUrl + `/admin?msg=QR code "${label}" aangemaakt!&qrbuffer=${encodeURIComponent(qrBuffer.toString('base64'))}&qrid=${id}`);
+  res.redirect(req.baseUrl + `/admin?msg=QR code "${label}" aangemaakt!`);
 });
 
 router.post('/admin/delete/:id', async (req, res) => {

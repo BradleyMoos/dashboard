@@ -1,5 +1,6 @@
 const express = require('express');
-const path = require('path');
+const crypto  = require('crypto');
+const path    = require('path');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -9,15 +10,27 @@ app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
 
 // ─── Auth ─────────────────────────────────────────────────────────────────────
-const sessions = new Set();
+// Stateless token: HMAC van het wachtwoord — overleeft herstarts en meerdere processen
+function makeToken() {
+  return crypto.createHmac('sha256', DASHBOARD_PASSWORD).update('dashboard-auth').digest('hex');
+}
 
-app.get('/login', (req, res) => res.send(loginPage('')));
+function authMiddleware(req, res, next) {
+  const token = req.headers.cookie?.match(/dash_session=([^;]+)/)?.[1];
+  if (token === makeToken()) return next();
+  res.redirect('/login');
+}
+
+app.get('/login', (req, res) => {
+  // Al ingelogd? Stuur door naar dashboard
+  const token = req.headers.cookie?.match(/dash_session=([^;]+)/)?.[1];
+  if (token === makeToken()) return res.redirect('/');
+  res.send(loginPage(''));
+});
 
 app.post('/login', (req, res) => {
   if (req.body.password === DASHBOARD_PASSWORD) {
-    const token = Math.random().toString(36).slice(2) + Date.now().toString(36);
-    sessions.add(token);
-    res.setHeader('Set-Cookie', `dash_session=${token}; Path=/; HttpOnly`);
+    res.setHeader('Set-Cookie', `dash_session=${makeToken()}; Path=/; HttpOnly`);
     res.redirect('/');
   } else {
     res.send(loginPage('Fout wachtwoord, probeer opnieuw.'));
@@ -25,16 +38,9 @@ app.post('/login', (req, res) => {
 });
 
 app.get('/logout', (req, res) => {
-  const token = req.headers.cookie?.match(/dash_session=([^;]+)/)?.[1];
-  sessions.delete(token);
+  res.setHeader('Set-Cookie', 'dash_session=; Path=/; HttpOnly; Max-Age=0');
   res.redirect('/login');
 });
-
-function authMiddleware(req, res, next) {
-  const token = req.headers.cookie?.match(/dash_session=([^;]+)/)?.[1];
-  if (sessions.has(token)) return next();
-  res.redirect('/login');
-}
 
 // ─── Beveiligde routes ────────────────────────────────────────────────────────
 app.get('/', authMiddleware, (req, res) => res.sendFile(path.join(__dirname, 'index.html')));
