@@ -63,6 +63,15 @@ async function initDB() {
   const defaults = {
     price_per_gb_month: '0.006',
     price_per_gb_egress: '0.01',
+    price_class_b_per_10000: '0.004',
+    price_class_c_per_1000: '0.004',
+    free_class_b_per_day: '2500',
+    free_class_c_per_day: '2500',
+    free_egress_multiplier: '3',
+    class_c_per_upload: '1',
+    monthly_downloads: '0',
+    monthly_egress_gb: '0',
+    last_sync_class_c_calls: '0',
     currency: 'EUR',
     usd_to_eur: '0.92',
     threshold_storage_gb: '5000',
@@ -97,6 +106,7 @@ async function setSetting(key, value) {
 
 // ─── Backblaze B2 API service ────────────────────────────────────────────────
 let b2Auth = null; // { apiUrl, authToken, accountId, expiresAt }
+let b2ClassCCallsThisSync = 0; // teller voor Class C calls gedurende één runSync
 
 async function b2Authorize() {
   if (!B2_KEY_ID || !B2_APPLICATION_KEY) {
@@ -108,6 +118,7 @@ async function b2Authorize() {
   const res = await fetch('https://api.backblazeb2.com/b2api/v3/b2_authorize_account', {
     headers: { Authorization: `Basic ${creds}` }
   });
+  b2ClassCCallsThisSync++; // b2_authorize_account = Class C
   if (!res.ok) throw new Error(`b2_authorize_account ${res.status}: ${await res.text()}`);
   const data = await res.json();
 
@@ -127,6 +138,7 @@ async function b2Post(path, body) {
     headers: { Authorization: auth.authToken, 'Content-Type': 'application/json' },
     body: JSON.stringify(body)
   });
+  b2ClassCCallsThisSync++; // b2_list_buckets / b2_list_file_versions = Class C
   if (res.status === 401) {
     b2Auth = null; // force re-auth
     return b2Post(path, body);
@@ -174,6 +186,7 @@ async function runSync() {
   if (syncInProgress) return { skipped: true };
   syncInProgress = true;
   const startedAt = Date.now();
+  b2ClassCCallsThisSync = 0;
   try {
     const buckets = await b2ListBuckets();
     let grandTotalBytes = 0;
@@ -206,6 +219,7 @@ async function runSync() {
 
     await setSetting('last_sync_at', now.toISOString());
     await setSetting('last_sync_ms', String(Date.now() - startedAt));
+    await setSetting('last_sync_class_c_calls', String(b2ClassCCallsThisSync));
     await checkAlerts(grandTotalBytes);
 
     lastSyncError = null;
@@ -320,6 +334,76 @@ function estimateMonthlyCost(totalBytes, settings) {
   return { usd, eur, totalGB };
 }
 
+// Volledige breakdown: storage + class B + class C + egress.
+// monthlyUploads: schatting hoeveel uploads er per maand zijn (uit snapshot deltas)
+function estimateCostBreakdown(totalBytes, monthlyUploads, settings) {
+  const totalGB        = Number(totalBytes || 0) / 1e9;
+  const usdToEur       = Number(settings.usd_to_eur || 0.92);
+  const priceGBMonth   = Number(settings.price_per_gb_month || 0.006);
+  const priceGBEgress  = Number(settings.price_per_gb_egress || 0.01);
+  const priceClassB10k = Number(settings.price_class_b_per_10000 || 0.004);
+  const priceClassC1k  = Number(settings.price_class_c_per_1000  || 0.004);
+  const freeB          = Number(settings.free_class_b_per_day || 2500);
+  const freeC          = Number(settings.free_class_c_per_day || 2500);
+  const egressMult     = Number(settings.free_egress_multiplier || 3);
+  const cCallsPerUpload= Number(settings.class_c_per_upload || 1);
+  const monthlyDownloads = Number(settings.monthly_downloads || 0);
+  const monthlyEgressGB  = Number(settings.monthly_egress_gb || 0);
+  const lastSyncCalls  = Number(settings.last_sync_class_c_calls || 0);
+  const syncHours      = Math.max(1, Number(settings.sync_interval_hours || 6));
+  const syncsPerDay    = 24 / syncHours;
+
+  // Storage
+  const storageUSD = totalGB * priceGBMonth;
+
+  // Class C: uploads + onze eigen sync calls
+  const uploadsPerDay  = monthlyUploads / 30;
+  const classCPerDay   = (uploadsPerDay * cCallsPerUpload) + (lastSyncCalls * syncsPerDay);
+  const billableCDay   = Math.max(0, classCPerDay - freeC);
+  const classCUSD      = (billableCDay * 30 / 1000) * priceClassC1k;
+
+  // Class B: downloads
+  const downloadsPerDay = monthlyDownloads / 30;
+  const billableBDay    = Math.max(0, downloadsPerDay - freeB);
+  const classBUSD       = (billableBDay * 30 / 10000) * priceClassB10k;
+
+  // Egress: 3× storage gratis per dag
+  const egressFreeDay  = totalGB * egressMult;
+  const egressUsedDay  = monthlyEgressGB / 30;
+  const billableEgress = Math.max(0, egressUsedDay - egressFreeDay) * 30;
+  const egressUSD      = billableEgress * priceGBEgress;
+
+  const totalUSD = storageUSD + classBUSD + classCUSD + egressUSD;
+
+  return {
+    storage:      { usd: storageUSD, eur: storageUSD * usdToEur },
+    classC:       { usd: classCUSD, eur: classCUSD * usdToEur, callsPerDay: classCPerDay, freeRemaining: Math.max(0, freeC - classCPerDay) },
+    classB:       { usd: classBUSD, eur: classBUSD * usdToEur, callsPerDay: downloadsPerDay, freeRemaining: Math.max(0, freeB - downloadsPerDay) },
+    egress:       { usd: egressUSD, eur: egressUSD * usdToEur, freePerDayGB: egressFreeDay, usedPerDayGB: egressUsedDay },
+    total:        { usd: totalUSD, eur: totalUSD * usdToEur },
+    assumptions:  { totalGB, monthlyUploads, syncsPerDay, lastSyncCalls, cCallsPerUpload }
+  };
+}
+
+// Som van positieve file_count delta's tussen totaal-snapshots, geschaald naar 30 dagen
+async function estimateMonthlyUploads() {
+  const [rows] = await pool.execute(
+    `SELECT file_count, snapshot_at FROM b2_storage_snapshots
+     WHERE bucket_id IS NULL AND snapshot_at >= DATE_SUB(NOW(), INTERVAL 30 DAY)
+     ORDER BY snapshot_at ASC`
+  );
+  if (rows.length < 2) return 0;
+  let positiveSum = 0;
+  for (let i = 1; i < rows.length; i++) {
+    const delta = Number(rows[i].file_count) - Number(rows[i - 1].file_count);
+    if (delta > 0) positiveSum += delta;
+  }
+  const firstTime = new Date(rows[0].snapshot_at).getTime();
+  const lastTime  = new Date(rows[rows.length - 1].snapshot_at).getTime();
+  const periodDays = Math.max(0.5, (lastTime - firstTime) / (24 * 60 * 60 * 1000));
+  return (positiveSum / periodDays) * 30;
+}
+
 // ─── Routes ──────────────────────────────────────────────────────────────────
 // Wrapper zodat async errors een nette 500 worden i.p.v. proces-crash (Express 4)
 function safe(fn) {
@@ -360,6 +444,8 @@ router.get('/overview', safe(async (req, res) => {
   const weeklyGrowthBytes = Number(latest.total_bytes) - prev7d;
 
   const cost = estimateMonthlyCost(latest.total_bytes, settings);
+  const monthlyUploads = await estimateMonthlyUploads();
+  const breakdown = estimateCostBreakdown(latest.total_bytes, monthlyUploads, settings);
 
   const [recentAlerts] = await pool.execute(
     'SELECT * FROM b2_alerts WHERE acknowledged = 0 ORDER BY triggered_at DESC LIMIT 3'
@@ -384,8 +470,8 @@ router.get('/overview', safe(async (req, res) => {
       </div>
       <div class="stat-card">
         <div class="label">Geschatte maandkosten</div>
-        <div class="value">€${cost.eur.toFixed(2)}</div>
-        <div class="sub">$${cost.usd.toFixed(2)} @ ${settings.price_per_gb_month} $/GB</div>
+        <div class="value">€${breakdown.total.eur.toFixed(2)}</div>
+        <div class="sub">$${breakdown.total.usd.toFixed(2)} totaal · zie breakdown ↓</div>
       </div>
       <div class="stat-card">
         <div class="label">Groei laatste 24u</div>
@@ -401,6 +487,50 @@ router.get('/overview', safe(async (req, res) => {
           </form>
         </div>
       </div>
+    </div>
+
+    <div class="panel">
+      <h3>Kosten breakdown (schatting per maand)</h3>
+      <table>
+        <thead><tr><th>Onderdeel</th><th>Detail</th><th>USD</th><th>EUR</th></tr></thead>
+        <tbody>
+          <tr>
+            <td><strong>Storage</strong></td>
+            <td class="muted">${breakdown.assumptions.totalGB.toFixed(2)} GB × $${settings.price_per_gb_month}/GB/mnd</td>
+            <td>$${breakdown.storage.usd.toFixed(3)}</td>
+            <td><strong>€${breakdown.storage.eur.toFixed(2)}</strong></td>
+          </tr>
+          <tr>
+            <td><strong>Class C</strong> (lijst/get/upload-url)</td>
+            <td class="muted">~${Math.round(breakdown.classC.callsPerDay)} calls/dag · ${breakdown.classC.freeRemaining > 0 ? `binnen free tier (nog ${Math.round(breakdown.classC.freeRemaining)} over)` : 'over free tier'}</td>
+            <td>$${breakdown.classC.usd.toFixed(3)}</td>
+            <td><strong>€${breakdown.classC.eur.toFixed(2)}</strong></td>
+          </tr>
+          <tr>
+            <td><strong>Class B</strong> (downloads)</td>
+            <td class="muted">~${Math.round(breakdown.classB.callsPerDay)} calls/dag${Number(settings.monthly_downloads) === 0 ? ' · geen ingesteld' : ''}</td>
+            <td>$${breakdown.classB.usd.toFixed(3)}</td>
+            <td><strong>€${breakdown.classB.eur.toFixed(2)}</strong></td>
+          </tr>
+          <tr>
+            <td><strong>Egress</strong> (download bandwidth)</td>
+            <td class="muted">${breakdown.egress.usedPerDayGB.toFixed(2)} GB/dag · ${breakdown.egress.freePerDayGB.toFixed(2)} GB/dag gratis (3× storage)</td>
+            <td>$${breakdown.egress.usd.toFixed(3)}</td>
+            <td><strong>€${breakdown.egress.eur.toFixed(2)}</strong></td>
+          </tr>
+          <tr style="background:rgba(99,102,241,.08)">
+            <td><strong>Totaal</strong></td>
+            <td class="muted">som van bovenstaande</td>
+            <td><strong>$${breakdown.total.usd.toFixed(2)}</strong></td>
+            <td><strong style="color:var(--accent-2)">€${breakdown.total.eur.toFixed(2)}</strong></td>
+          </tr>
+        </tbody>
+      </table>
+      <p class="muted" style="margin-top:14px;font-size:.78rem">
+        ⓘ Aannames: ~${Math.round(breakdown.assumptions.monthlyUploads).toLocaleString('nl-NL')} uploads/mnd (uit snapshot-deltas) ·
+        ${breakdown.assumptions.lastSyncCalls} Class C calls per sync × ${breakdown.assumptions.syncsPerDay.toFixed(1)} syncs/dag ·
+        Downloads/egress zijn handmatige invoer (Settings). B2 biedt geen API voor werkelijk verbruik — exact factuur in B2 web-billing.
+      </p>
     </div>
 
     <div class="panel">
@@ -607,6 +737,46 @@ router.get('/settings', safe(async (req, res) => {
             <input type="number" name="sync_interval_hours" min="1" max="168" value="${escapeHtml(settings.sync_interval_hours)}" required>
           </div>
         </div>
+        <h4 style="margin-top:24px;margin-bottom:12px;font-size:.85rem;color:#94a3b8">Transactiekosten (B2 free tiers staan al ingevuld)</h4>
+        <div class="form-grid">
+          <div class="form-group">
+            <label>Class B prijs (USD per 10.000)</label>
+            <input type="text" name="price_class_b_per_10000" value="${escapeHtml(settings.price_class_b_per_10000)}">
+          </div>
+          <div class="form-group">
+            <label>Class C prijs (USD per 1.000)</label>
+            <input type="text" name="price_class_c_per_1000" value="${escapeHtml(settings.price_class_c_per_1000)}">
+          </div>
+          <div class="form-group">
+            <label>Class B free tier (per dag)</label>
+            <input type="number" step="any" name="free_class_b_per_day" value="${escapeHtml(settings.free_class_b_per_day)}">
+          </div>
+          <div class="form-group">
+            <label>Class C free tier (per dag)</label>
+            <input type="number" step="any" name="free_class_c_per_day" value="${escapeHtml(settings.free_class_c_per_day)}">
+          </div>
+          <div class="form-group">
+            <label>Class C calls per upload (aanname)</label>
+            <input type="text" name="class_c_per_upload" value="${escapeHtml(settings.class_c_per_upload)}">
+          </div>
+          <div class="form-group">
+            <label>Egress free tier (× storage/dag)</label>
+            <input type="number" step="any" name="free_egress_multiplier" value="${escapeHtml(settings.free_egress_multiplier)}">
+          </div>
+        </div>
+
+        <h4 style="margin-top:24px;margin-bottom:12px;font-size:.85rem;color:#94a3b8">Handmatige aannames (B2 biedt hier geen API voor)</h4>
+        <div class="form-grid">
+          <div class="form-group">
+            <label>Verwachte downloads / maand</label>
+            <input type="number" step="any" name="monthly_downloads" value="${escapeHtml(settings.monthly_downloads)}">
+          </div>
+          <div class="form-group">
+            <label>Verwachte egress GB / maand</label>
+            <input type="number" step="any" name="monthly_egress_gb" value="${escapeHtml(settings.monthly_egress_gb)}">
+          </div>
+        </div>
+
         <h4 style="margin-top:24px;margin-bottom:12px;font-size:.85rem;color:#94a3b8">Alert-drempels (0 = uit)</h4>
         <div class="form-grid">
           <div class="form-group">
@@ -632,8 +802,10 @@ router.get('/settings', safe(async (req, res) => {
 
 router.post('/settings', safe(async (req, res) => {
   const keys = [
-    'price_per_gb_month','price_per_gb_egress','usd_to_eur',
-    'sync_interval_hours','threshold_storage_gb','threshold_cost_eur','threshold_daily_growth_gb'
+    'price_per_gb_month','price_per_gb_egress','usd_to_eur','sync_interval_hours',
+    'price_class_b_per_10000','price_class_c_per_1000','free_class_b_per_day','free_class_c_per_day',
+    'class_c_per_upload','free_egress_multiplier','monthly_downloads','monthly_egress_gb',
+    'threshold_storage_gb','threshold_cost_eur','threshold_daily_growth_gb'
   ];
   for (const k of keys) {
     if (typeof req.body[k] !== 'undefined') await setSetting(k, req.body[k]);
