@@ -50,6 +50,8 @@ app.use('/qr-tracker', (req, res, next) => {
   authMiddleware(req, res, next);
 }, require('./apps/qr-tracker'));
 
+app.use('/b2-tracker', authMiddleware, require('./apps/b2-tracker'));
+
 // ─── Start ────────────────────────────────────────────────────────────────────
 app.listen(PORT, () => {
   console.log(`Dashboard draait op http://localhost:${PORT}`);
