@@ -385,13 +385,19 @@ function estimateCostBreakdown(totalBytes, monthlyUploads, settings) {
   };
 }
 
-// Som van positieve file_count delta's tussen totaal-snapshots, geschaald naar 30 dagen
-async function estimateMonthlyUploads() {
-  const [rows] = await pool.execute(
-    `SELECT file_count, snapshot_at FROM b2_storage_snapshots
-     WHERE bucket_id IS NULL AND snapshot_at >= DATE_SUB(NOW(), INTERVAL 30 DAY)
-     ORDER BY snapshot_at ASC`
-  );
+// Som van positieve file_count delta's tussen snapshots, geschaald naar 30 dagen.
+// bucketId = null → totaal-snapshots; anders specifieke bucket
+async function estimateMonthlyUploads(bucketId = null) {
+  const [rows] = bucketId === null
+    ? await pool.execute(
+        `SELECT file_count, snapshot_at FROM b2_storage_snapshots
+         WHERE bucket_id IS NULL AND snapshot_at >= DATE_SUB(NOW(), INTERVAL 30 DAY)
+         ORDER BY snapshot_at ASC`)
+    : await pool.execute(
+        `SELECT file_count, snapshot_at FROM b2_storage_snapshots
+         WHERE bucket_id = ? AND snapshot_at >= DATE_SUB(NOW(), INTERVAL 30 DAY)
+         ORDER BY snapshot_at ASC`,
+        [bucketId]);
   if (rows.length < 2) return 0;
   let positiveSum = 0;
   for (let i = 1; i < rows.length; i++) {
@@ -402,6 +408,37 @@ async function estimateMonthlyUploads() {
   const lastTime  = new Date(rows[rows.length - 1].snapshot_at).getTime();
   const periodDays = Math.max(0.5, (lastTime - firstTime) / (24 * 60 * 60 * 1000));
   return (positiveSum / periodDays) * 30;
+}
+
+// Per-bucket kostenverdeling: storage exact, Class C op share-basis t.o.v. totaal (zodat per-bucket totalen optellen tot het globale totaal). Downloads/egress blijven aggregate.
+function perBucketBreakdown(bucket, settings, monthlyUploadsBucket, totalsBreakdown) {
+  const usdToEur     = Number(settings.usd_to_eur || 0.92);
+  const priceGBMonth = Number(settings.price_per_gb_month || 0.006);
+  const cPerUpload   = Number(settings.class_c_per_upload || 1);
+  const syncHours    = Math.max(1, Number(settings.sync_interval_hours || 6));
+  const syncsPerDay  = 24 / syncHours;
+  const storageGB    = Number(bucket.current_bytes || 0) / 1e9;
+
+  // Storage onafhankelijk per bucket
+  const storageUSD = storageGB * priceGBMonth;
+
+  // Class C activiteit per dag voor deze bucket
+  const uploadsPerDay = monthlyUploadsBucket / 30;
+  const bucketSyncCalls = Math.ceil(Number(bucket.file_count || 0) / 10000) * syncsPerDay;
+  const bucketClassCDay = uploadsPerDay * cPerUpload + bucketSyncCalls;
+
+  // Share van totale Class C activiteit → apportioneer het totale Class C bedrag
+  const share = totalsBreakdown.classC.callsPerDay > 0
+    ? bucketClassCDay / totalsBreakdown.classC.callsPerDay
+    : 0;
+  const classCUSD = totalsBreakdown.classC.usd * share;
+
+  const totalUSD = storageUSD + classCUSD;
+  return {
+    storage:   { usd: storageUSD, eur: storageUSD * usdToEur },
+    classC:    { usd: classCUSD,  eur: classCUSD  * usdToEur, callsPerDay: bucketClassCDay },
+    total:     { usd: totalUSD,   eur: totalUSD   * usdToEur }
+  };
 }
 
 // ─── Routes ──────────────────────────────────────────────────────────────────
@@ -546,7 +583,15 @@ router.get('/buckets', safe(async (req, res) => {
   const settings = await getSettings();
   const [buckets] = await pool.execute('SELECT * FROM b2_buckets ORDER BY bucket_name ASC');
 
-  // Laatste snapshot per bucket + snapshot 7d geleden voor groei
+  // Globale breakdown nodig voor proportionele Class C verdeling
+  const [latestTotalRows] = await pool.execute(
+    'SELECT total_bytes FROM b2_storage_snapshots WHERE bucket_id IS NULL ORDER BY snapshot_at DESC LIMIT 1'
+  );
+  const grandTotalBytes = latestTotalRows[0] ? Number(latestTotalRows[0].total_bytes) : 0;
+  const totalMonthlyUploads = await estimateMonthlyUploads();
+  const totalsBreakdown = estimateCostBreakdown(grandTotalBytes, totalMonthlyUploads, settings);
+
+  // Per bucket: laatste snapshot, 7d groei, eigen uploads, breakdown
   const bucketRows = [];
   for (const b of buckets) {
     const [latest] = await pool.execute(
@@ -561,17 +606,33 @@ router.get('/buckets', safe(async (req, res) => {
     );
     const cur  = latest[0]  ? Number(latest[0].total_bytes)  : 0;
     const prev = weekAgo[0] ? Number(weekAgo[0].total_bytes) : cur;
+    const fileCount = latest[0] ? Number(latest[0].file_count) : 0;
     const growth = cur - prev;
-    const cost = estimateMonthlyCost(cur, settings);
+
+    const monthlyUploadsBucket = await estimateMonthlyUploads(b.bucket_id);
+    const bb = perBucketBreakdown(
+      { current_bytes: cur, file_count: fileCount },
+      settings,
+      monthlyUploadsBucket,
+      totalsBreakdown
+    );
+
     bucketRows.push({
       ...b,
       latest: latest[0] || null,
       current_bytes: cur,
-      file_count: latest[0] ? Number(latest[0].file_count) : 0,
+      file_count: fileCount,
       growth_7d: growth,
-      monthly_eur: cost.eur
+      storage_eur: bb.storage.eur,
+      classc_eur: bb.classC.eur,
+      total_eur: bb.total.eur,
+      monthly_uploads: monthlyUploadsBucket
     });
   }
+
+  const bucketsTotalStorage = bucketRows.reduce((s, b) => s + b.storage_eur, 0);
+  const bucketsTotalClassC  = bucketRows.reduce((s, b) => s + b.classc_eur, 0);
+  const bucketsTotalAll     = bucketsTotalStorage + bucketsTotalClassC;
 
   res.send(shell(req.baseUrl, 'buckets', req.query.msg, `
     <div class="panel">
@@ -579,20 +640,35 @@ router.get('/buckets', safe(async (req, res) => {
       ${bucketRows.length === 0 ? '<p class="muted">Nog geen buckets gesynchroniseerd. Klik op "Sync nu" in Overview.</p>' : `
       <table>
         <thead><tr>
-          <th>Bucket</th><th>Type</th><th>Opslag</th><th>Bestanden</th><th>Groei 7d</th><th>~Maandkosten</th><th>Laatste sync</th>
+          <th>Bucket</th><th>Opslag</th><th>Bestanden</th><th>Groei 7d</th><th>Uploads/mnd</th><th>Storage €/mnd</th><th>Class C €/mnd</th><th>Totaal €/mnd</th>
         </tr></thead>
         <tbody>
           ${bucketRows.map(b => `<tr>
-            <td><strong>${escapeHtml(b.bucket_name)}</strong><br><span class="mono">${b.bucket_id}</span></td>
-            <td><span class="badge">${escapeHtml(b.bucket_type || '—')}</span></td>
+            <td>
+              <strong>${escapeHtml(b.bucket_name)}</strong>
+              <br><span class="mono">${b.bucket_id}</span>
+              ${b.bucket_type ? ` <span class="badge" style="margin-left:4px">${escapeHtml(b.bucket_type)}</span>` : ''}
+            </td>
             <td>${fmtBytes(b.current_bytes)}</td>
             <td>${b.file_count.toLocaleString('nl-NL')}</td>
             <td class="${b.growth_7d >= 0 ? 'pos' : 'neg'}">${b.growth_7d >= 0 ? '+' : '-'}${fmtBytes(Math.abs(b.growth_7d))}</td>
-            <td>€${b.monthly_eur.toFixed(2)}</td>
-            <td class="muted">${fmtDateTime(b.latest?.snapshot_at)}</td>
+            <td class="muted">~${Math.round(b.monthly_uploads).toLocaleString('nl-NL')}</td>
+            <td>€${b.storage_eur.toFixed(2)}</td>
+            <td>€${b.classc_eur.toFixed(2)}</td>
+            <td><strong style="color:var(--accent-2)">€${b.total_eur.toFixed(2)}</strong></td>
           </tr>`).join('')}
+          <tr style="background:rgba(99,102,241,.08);font-weight:600">
+            <td colspan="5" style="text-align:right" class="muted">Subtotaal buckets (storage + Class C):</td>
+            <td>€${bucketsTotalStorage.toFixed(2)}</td>
+            <td>€${bucketsTotalClassC.toFixed(2)}</td>
+            <td><strong style="color:var(--accent-2)">€${bucketsTotalAll.toFixed(2)}</strong></td>
+          </tr>
         </tbody>
-      </table>`}
+      </table>
+      <p class="muted" style="margin-top:14px;font-size:.78rem">
+        ⓘ Storage is exact per bucket. Class C wordt naar rato van bucket-activiteit (uploads + sync-pages) verdeeld over de totale Class C kosten — per-bucket waarden tellen daarom op tot het globale totaal.
+        <br>Downloads en egress (€${totalsBreakdown.classB.eur.toFixed(2)} + €${totalsBreakdown.egress.eur.toFixed(2)}) zijn alleen op accountniveau — B2 levert geen per-bucket transactiegegevens.
+      </p>`}
     </div>
   `));
 }));
