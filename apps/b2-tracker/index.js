@@ -58,6 +58,13 @@ async function initDB() {
       INDEX idx_triggered (triggered_at)
     )
   `);
+  await pool.execute(`
+    CREATE TABLE IF NOT EXISTS b2_monthly_invoices (
+      year_month         VARCHAR(7)    PRIMARY KEY,
+      actual_invoice_eur DECIMAL(10,2) NULL,
+      updated_at         DATETIME      NOT NULL
+    )
+  `);
 
   // Seed default settings
   const defaults = {
@@ -417,6 +424,104 @@ async function estimateMonthlyUploads(bucketId = null) {
   return (positiveSum / periodDays) * 30;
 }
 
+function daysInMonth(ymStr) {
+  const [y, m] = ymStr.split('-').map(Number);
+  return new Date(y, m, 0).getDate();
+}
+
+// Per-maand breakdown over alle total-snapshots. Storage en uploads zijn historisch
+// exact (uit snapshots); downloads/egress passen huidige settings toe op elke maand.
+async function computeMonthlyBreakdowns() {
+  const [rows] = await pool.execute(
+    `SELECT total_bytes, file_count, snapshot_at FROM b2_storage_snapshots
+     WHERE bucket_id IS NULL ORDER BY snapshot_at ASC`
+  );
+  if (rows.length === 0) return [];
+
+  const settings = await getSettings();
+  const usdToEur       = Number(settings.usd_to_eur || 0.92);
+  const priceGBMonth   = Number(settings.price_per_gb_month || 0.006);
+  const priceGBEgress  = Number(settings.price_per_gb_egress || 0.01);
+  const priceClassB10k = Number(settings.price_class_b_per_10000 || 0.004);
+  const priceClassC1k  = Number(settings.price_class_c_per_1000 || 0.004);
+  const freeB          = Number(settings.free_class_b_per_day || 2500);
+  const freeC          = Number(settings.free_class_c_per_day || 2500);
+  const egressMult     = Number(settings.free_egress_multiplier || 3);
+  const cPerUpload     = Number(settings.class_c_per_upload || 1);
+  const monthlyDownloads = Number(settings.monthly_downloads || 0);
+  const monthlyEgressGB  = Number(settings.monthly_egress_gb || 0);
+  const lastSyncCalls  = Number(settings.last_sync_class_c_calls || 0);
+
+  const months = new Map();
+  let prevFileCount = null;
+  for (const r of rows) {
+    const d = new Date(r.snapshot_at);
+    const ym = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
+    if (!months.has(ym)) {
+      months.set(ym, { bytesSum: 0, bytesCount: 0, snapshotCount: 0, uploads: 0 });
+    }
+    const m = months.get(ym);
+    m.bytesSum += Number(r.total_bytes);
+    m.bytesCount++;
+    m.snapshotCount++;
+    if (prevFileCount !== null) {
+      const delta = Number(r.file_count) - prevFileCount;
+      if (delta > 0) m.uploads += delta;
+    }
+    prevFileCount = Number(r.file_count);
+  }
+
+  const [invoices] = await pool.execute(
+    'SELECT year_month, actual_invoice_eur FROM b2_monthly_invoices'
+  );
+  const invoiceMap = new Map(invoices.map(i => [i.year_month, Number(i.actual_invoice_eur)]));
+
+  const now = new Date();
+  const currentYm = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
+
+  const result = [];
+  for (const [ym, m] of months) {
+    const avgGB = (m.bytesSum / m.bytesCount) / 1e9;
+    const days  = daysInMonth(ym);
+
+    const storageUSD = avgGB * priceGBMonth;
+
+    const totalCCalls    = m.uploads * cPerUpload + m.snapshotCount * lastSyncCalls;
+    const cCallsPerDay   = totalCCalls / days;
+    const billableCPerDay= Math.max(0, cCallsPerDay - freeC);
+    const classCUSD      = (billableCPerDay * days / 1000) * priceClassC1k;
+
+    const downloadsThisMonth = monthlyDownloads * (days / 30);
+    const downloadsPerDay    = downloadsThisMonth / days;
+    const billableBPerDay    = Math.max(0, downloadsPerDay - freeB);
+    const classBUSD          = (billableBPerDay * days / 10000) * priceClassB10k;
+
+    const egressFreeTotal = avgGB * egressMult * days;
+    const egressUsedTotal = monthlyEgressGB * (days / 30);
+    const billableEgress  = Math.max(0, egressUsedTotal - egressFreeTotal);
+    const egressUSD       = billableEgress * priceGBEgress;
+
+    const totalUSD = storageUSD + classCUSD + classBUSD + egressUSD;
+
+    result.push({
+      ym,
+      isCurrent: ym === currentYm,
+      avgGB,
+      uploads: m.uploads,
+      snapshotCount: m.snapshotCount,
+      storage_eur: storageUSD * usdToEur,
+      classc_eur:  classCUSD  * usdToEur,
+      classb_eur:  classBUSD  * usdToEur,
+      egress_eur:  egressUSD  * usdToEur,
+      total_eur:   totalUSD   * usdToEur,
+      total_usd:   totalUSD,
+      actual_invoice_eur: invoiceMap.has(ym) ? invoiceMap.get(ym) : null
+    });
+  }
+  result.sort((a, b) => b.ym.localeCompare(a.ym));
+  return result;
+}
+
 // Per-bucket kostenverdeling: storage exact, Class C op share-basis t.o.v. totaal (zodat per-bucket totalen optellen tot het globale totaal). Downloads/egress blijven aggregate.
 function perBucketBreakdown(bucket, settings, monthlyUploadsBucket, totalsBreakdown) {
   const usdToEur     = Number(settings.usd_to_eur || 0.92);
@@ -752,6 +857,81 @@ router.get('/analytics', safe(async (req, res) => {
   `));
 }));
 
+router.get('/months', safe(async (req, res) => {
+  const months = await computeMonthlyBreakdowns();
+  const settings = await getSettings();
+
+  res.send(shell(req.baseUrl, 'months', req.query.msg, `
+    <div class="panel">
+      <h3>Maandoverzicht — geschatte totalen per maand</h3>
+      ${months.length === 0 ? '<p class="muted">Nog geen snapshots — sync eerst via Overview.</p>' : `
+      <div class="table-wrap">
+      <table>
+        <thead><tr>
+          <th>Maand</th><th>Gem. opslag</th><th>Uploads</th>
+          <th>Storage</th><th>Class C</th><th>Class B</th><th>Egress</th>
+          <th>Schatting €</th><th>Echte factuur €</th><th>Δ</th>
+        </tr></thead>
+        <tbody>
+          ${months.map(m => {
+            const diff = m.actual_invoice_eur !== null ? m.total_eur - m.actual_invoice_eur : null;
+            const diffClass = diff === null ? 'muted' : (Math.abs(diff) < 0.5 ? 'pos' : 'neg');
+            const diffStr = diff === null ? '—' : `${diff >= 0 ? '+' : ''}€${diff.toFixed(2)}`;
+            return `<tr${m.isCurrent ? ' style="background:rgba(99,102,241,.05)"' : ''}>
+              <td>
+                <strong>${m.ym}</strong>${m.isCurrent ? ' <span class="badge">loopt nog</span>' : ''}
+                <br><span class="muted" style="font-size:.72rem">${m.snapshotCount} snapshots</span>
+              </td>
+              <td>${m.avgGB.toFixed(2)} GB</td>
+              <td>${m.uploads.toLocaleString('nl-NL')}</td>
+              <td>€${m.storage_eur.toFixed(2)}</td>
+              <td>€${m.classc_eur.toFixed(2)}</td>
+              <td>€${m.classb_eur.toFixed(2)}</td>
+              <td>€${m.egress_eur.toFixed(2)}</td>
+              <td><strong style="color:var(--accent-2)">€${m.total_eur.toFixed(2)}</strong><br><span class="muted" style="font-size:.7rem">$${m.total_usd.toFixed(2)}</span></td>
+              <td>
+                <form method="POST" action="${req.baseUrl}/months/invoice" style="display:flex;gap:4px;align-items:center">
+                  <input type="hidden" name="year_month" value="${m.ym}">
+                  <input type="number" step="0.01" min="0" name="actual_invoice_eur" value="${m.actual_invoice_eur ?? ''}" placeholder="—" style="width:84px;padding:5px 8px;font-size:.82rem">
+                  <button class="btn btn-sm btn-secondary" type="submit" title="Opslaan">✓</button>
+                </form>
+              </td>
+              <td><span class="${diffClass}">${diffStr}</span></td>
+            </tr>`;
+          }).join('')}
+        </tbody>
+      </table>
+      </div>
+      <p class="muted" style="margin-top:14px;font-size:.78rem">
+        ⓘ <strong>Storage</strong> en <strong>uploads</strong> zijn historisch exact uit snapshots in die maand.
+        <strong>Class B / Egress</strong> passen de huidige Settings-waarden toe (B2 levert geen historische download/egress data zonder Event Notifications).
+        Vul de echte factuur in om je aannames (downloads/egress, koers) te kalibreren — Δ-kolom toont schatting − werkelijk. Huidige koers: ${settings.usd_to_eur} USD→EUR.
+      </p>`}
+    </div>
+  `));
+}));
+
+router.post('/months/invoice', safe(async (req, res) => {
+  const ym = String(req.body.year_month || '').match(/^\d{4}-\d{2}$/)?.[0];
+  if (!ym) return res.redirect(req.baseUrl + '/months?msg=Ongeldige maand');
+  const raw = req.body.actual_invoice_eur;
+  if (raw === '' || raw == null) {
+    await pool.execute('DELETE FROM b2_monthly_invoices WHERE year_month = ?', [ym]);
+    return res.redirect(req.baseUrl + '/months?msg=Factuur verwijderd voor ' + ym);
+  }
+  const val = Number(raw);
+  if (!Number.isFinite(val) || val < 0) {
+    return res.redirect(req.baseUrl + '/months?msg=Ongeldig bedrag');
+  }
+  await pool.execute(
+    `INSERT INTO b2_monthly_invoices (year_month, actual_invoice_eur, updated_at)
+     VALUES (?,?,NOW())
+     ON DUPLICATE KEY UPDATE actual_invoice_eur = VALUES(actual_invoice_eur), updated_at = NOW()`,
+    [ym, val]
+  );
+  res.redirect(req.baseUrl + '/months?msg=Factuur opgeslagen voor ' + ym);
+}));
+
 router.get('/alerts', safe(async (req, res) => {
   const [alerts] = await pool.execute('SELECT * FROM b2_alerts ORDER BY triggered_at DESC LIMIT 100');
 
@@ -923,6 +1103,7 @@ function shell(base, active, msg, content) {
   const nav = [
     ['overview',  '📊', 'Overview'],
     ['buckets',   '🪣', 'Buckets'],
+    ['months',    '📅', 'Maanden'],
     ['analytics', '📈', 'Analytics'],
     ['alerts',    '🔔', 'Alerts'],
     ['settings',  '⚙️',  'Settings']
