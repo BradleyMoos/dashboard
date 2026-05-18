@@ -324,7 +324,14 @@ function fmtBytes(bytes) {
 
 function fmtDateTime(d) {
   if (!d) return '—';
-  return new Date(d).toLocaleString('nl-NL', { dateStyle: 'short', timeStyle: 'short' });
+  const date = new Date(d);
+  const iso = date.toISOString();
+  const fallback = date.toLocaleString('nl-NL', {
+    dateStyle: 'short',
+    timeStyle: 'short',
+    timeZone: 'Europe/Amsterdam'
+  });
+  return `<time data-iso="${iso}">${fallback}</time>`;
 }
 
 function estimateMonthlyCost(totalBytes, settings) {
@@ -528,6 +535,7 @@ router.get('/overview', safe(async (req, res) => {
 
     <div class="panel">
       <h3>Kosten breakdown (schatting per maand)</h3>
+      <div class="table-wrap">
       <table>
         <thead><tr><th>Onderdeel</th><th>Detail</th><th>USD</th><th>EUR</th></tr></thead>
         <tbody>
@@ -563,6 +571,7 @@ router.get('/overview', safe(async (req, res) => {
           </tr>
         </tbody>
       </table>
+      </div>
       <p class="muted" style="margin-top:14px;font-size:.78rem">
         ⓘ Aannames: ~${Math.round(breakdown.assumptions.monthlyUploads).toLocaleString('nl-NL')} uploads/mnd (uit snapshot-deltas) ·
         ${breakdown.assumptions.lastSyncCalls} Class C calls per sync × ${breakdown.assumptions.syncsPerDay.toFixed(1)} syncs/dag ·
@@ -638,6 +647,7 @@ router.get('/buckets', safe(async (req, res) => {
     <div class="panel">
       <h3>Buckets (${bucketRows.length})</h3>
       ${bucketRows.length === 0 ? '<p class="muted">Nog geen buckets gesynchroniseerd. Klik op "Sync nu" in Overview.</p>' : `
+      <div class="table-wrap">
       <table>
         <thead><tr>
           <th>Bucket</th><th>Opslag</th><th>Bestanden</th><th>Groei 7d</th><th>Uploads/mnd</th><th>Storage €/mnd</th><th>Class C €/mnd</th><th>Totaal €/mnd</th>
@@ -665,6 +675,7 @@ router.get('/buckets', safe(async (req, res) => {
           </tr>
         </tbody>
       </table>
+      </div>
       <p class="muted" style="margin-top:14px;font-size:.78rem">
         ⓘ Storage is exact per bucket. Class C wordt naar rato van bucket-activiteit (uploads + sync-pages) verdeeld over de totale Class C kosten — per-bucket waarden tellen daarom op tot het globale totaal.
         <br>Downloads en egress (€${totalsBreakdown.classB.eur.toFixed(2)} + €${totalsBreakdown.egress.eur.toFixed(2)}) zijn alleen op accountniveau — B2 levert geen per-bucket transactiegegevens.
@@ -748,6 +759,7 @@ router.get('/alerts', safe(async (req, res) => {
     <div class="panel">
       <h3>Alerts</h3>
       ${alerts.length === 0 ? '<p class="muted">Nog geen alerts.</p>' : `
+      <div class="table-wrap">
       <table>
         <thead><tr><th>Tijd</th><th>Type</th><th>Bericht</th><th>Waarde</th><th>Drempel</th><th>Status</th><th></th></tr></thead>
         <tbody>
@@ -763,7 +775,8 @@ router.get('/alerts', safe(async (req, res) => {
             </td>
           </tr>`).join('')}
         </tbody>
-      </table>`}
+      </table>
+      </div>`}
     </div>
     <div class="panel">
       <h3>Drempels aanpassen</h3>
@@ -933,8 +946,42 @@ function shell(base, active, msg, content) {
     .aside-foot{margin-top:auto;display:flex;flex-direction:column;gap:6px;padding-top:16px;border-top:1px solid var(--border)}
     .aside-foot a{color:var(--muted);text-decoration:none;font-size:.78rem;padding:4px 8px;border-radius:6px}
     .aside-foot a:hover{color:var(--text);background:var(--surface-2)}
-    main{flex:1;padding:32px 40px;max-width:1200px}
-    @media(max-width:760px){body{flex-direction:column}aside{width:100%;height:auto;position:static;flex-direction:row;flex-wrap:wrap;padding:12px}aside .brand{width:100%;padding:0 0 8px;margin-bottom:8px}aside .aside-foot{margin-top:0;border:none;padding-top:0;flex-direction:row}main{padding:20px}}
+    main{flex:1;padding:32px 40px;max-width:1200px;min-width:0}
+    .table-wrap{overflow-x:auto;-webkit-overflow-scrolling:touch;margin:0 -4px}
+    .table-wrap table{margin:0}
+    @media(max-width:1024px){main{padding:24px 28px}}
+    @media(max-width:760px){
+      body{flex-direction:column}
+      aside{width:100%;height:auto;position:static;flex-direction:row;flex-wrap:wrap;padding:10px 12px;gap:4px}
+      aside .brand{width:100%;padding:0 0 6px;margin-bottom:6px;font-size:.98rem}
+      aside .nav-link{flex:1 1 calc(33.33% - 4px);min-width:0;justify-content:center;padding:8px 6px;font-size:.76rem;gap:5px}
+      aside .nav-link .ico{font-size:.95rem}
+      aside .aside-foot{margin-top:0;border:none;padding-top:6px;flex-direction:row;width:100%;justify-content:space-between}
+      main{padding:18px 14px;max-width:100%}
+      .panel{padding:16px 16px;border-radius:10px;margin-bottom:14px}
+      h3{font-size:.9rem;margin-bottom:10px}
+      h4{font-size:.82rem!important}
+      .stats{grid-template-columns:1fr 1fr;gap:10px;margin-bottom:14px}
+      .stat-card{padding:13px 14px;border-radius:10px}
+      .stat-card .label{font-size:.68rem;margin-bottom:6px}
+      .stat-card .value{font-size:1.25rem}
+      .stat-card .value.small{font-size:.88rem}
+      .stat-card .sub{font-size:.7rem}
+      table{font-size:.78rem;min-width:560px}
+      th{padding:7px 9px;font-size:.66rem}
+      td{padding:9px 9px}
+      .alerts-banner{padding:11px 14px;font-size:.82rem}
+      .warn,.msg{padding:9px 13px;font-size:.8rem}
+      .form-grid{grid-template-columns:1fr;gap:10px}
+      .btn{padding:8px 14px;font-size:.82rem}
+      .btn-sm{padding:6px 11px;font-size:.74rem}
+    }
+    @media(max-width:480px){
+      .stats{grid-template-columns:1fr}
+      main{padding:14px 10px}
+      .panel{padding:14px 14px}
+      aside .nav-link{flex:1 1 calc(50% - 4px)}
+    }
     h1,h2,h3,h4{font-weight:700;letter-spacing:-.01em}
     h3{font-size:.95rem;margin-bottom:14px;color:var(--text)}
     .msg{background:rgba(34,197,94,.12);color:#86efac;border:1px solid rgba(34,197,94,.3);padding:11px 16px;border-radius:8px;margin-bottom:20px;font-size:.875rem}
@@ -990,6 +1037,22 @@ function shell(base, active, msg, content) {
   ${msg ? `<div class="msg">${escapeHtml(msg)}</div>` : ''}
   ${content}
 </main>
+<script>
+  (function(){
+    var fmt;
+    try{
+      fmt = new Intl.DateTimeFormat('nl-NL', { dateStyle: 'short', timeStyle: 'short' });
+    }catch(e){ return; }
+    document.querySelectorAll('time[data-iso]').forEach(function(el){
+      var iso = el.getAttribute('data-iso');
+      if(!iso) return;
+      var d = new Date(iso);
+      if(isNaN(d)) return;
+      el.textContent = fmt.format(d);
+      el.setAttribute('title', d.toString());
+    });
+  })();
+</script>
 </body>
 </html>`;
 }
