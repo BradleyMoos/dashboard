@@ -60,7 +60,7 @@ async function initDB() {
   `);
   await pool.execute(`
     CREATE TABLE IF NOT EXISTS b2_monthly_invoices (
-      year_month         VARCHAR(7)    PRIMARY KEY,
+      \`year_month\`       VARCHAR(7)    PRIMARY KEY,
       actual_invoice_eur DECIMAL(10,2) NULL,
       updated_at         DATETIME      NOT NULL
     )
@@ -472,7 +472,7 @@ async function computeMonthlyBreakdowns() {
   }
 
   const [invoices] = await pool.execute(
-    'SELECT year_month, actual_invoice_eur FROM b2_monthly_invoices'
+    'SELECT `year_month`, actual_invoice_eur FROM b2_monthly_invoices'
   );
   const invoiceMap = new Map(invoices.map(i => [i.year_month, Number(i.actual_invoice_eur)]));
 
@@ -916,7 +916,7 @@ router.post('/months/invoice', safe(async (req, res) => {
   if (!ym) return res.redirect(req.baseUrl + '/months?msg=Ongeldige maand');
   const raw = req.body.actual_invoice_eur;
   if (raw === '' || raw == null) {
-    await pool.execute('DELETE FROM b2_monthly_invoices WHERE year_month = ?', [ym]);
+    await pool.execute('DELETE FROM b2_monthly_invoices WHERE `year_month` = ?', [ym]);
     return res.redirect(req.baseUrl + '/months?msg=Factuur verwijderd voor ' + ym);
   }
   const val = Number(raw);
@@ -924,7 +924,7 @@ router.post('/months/invoice', safe(async (req, res) => {
     return res.redirect(req.baseUrl + '/months?msg=Ongeldig bedrag');
   }
   await pool.execute(
-    `INSERT INTO b2_monthly_invoices (year_month, actual_invoice_eur, updated_at)
+    `INSERT INTO b2_monthly_invoices (\`year_month\`, actual_invoice_eur, updated_at)
      VALUES (?,?,NOW())
      ON DUPLICATE KEY UPDATE actual_invoice_eur = VALUES(actual_invoice_eur), updated_at = NOW()`,
     [ym, val]
