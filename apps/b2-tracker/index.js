@@ -218,6 +218,21 @@ async function runSync() {
       );
     }
 
+    // Prune: verwijder buckets die niet meer in B2 bestaan. b2ListBuckets is
+    // hierboven zonder fout gelukt, dus deze lijst is gezaghebbend. Snapshots
+    // blijven als historie staan (totaal-trends gebruiken bucket_id IS NULL).
+    const seenIds = buckets.map(b => b.bucketId);
+    if (seenIds.length) {
+      const placeholders = seenIds.map(() => '?').join(',');
+      await pool.execute(
+        `DELETE FROM b2_buckets WHERE bucket_id NOT IN (${placeholders})`,
+        seenIds
+      );
+    } else {
+      // Account heeft geen buckets meer → lijst volledig leegmaken
+      await pool.execute('DELETE FROM b2_buckets');
+    }
+
     // Totaal-snapshot (bucket_id NULL)
     await pool.execute(
       'INSERT INTO b2_storage_snapshots (id, bucket_id, total_bytes, file_count, snapshot_at) VALUES (?,NULL,?,?,?)',
