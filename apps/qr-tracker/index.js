@@ -8,11 +8,12 @@ const router = express.Router();
 const TRACKING_BASE = process.env.QR_TRACKING_BASE || 'https://dashboard.bradleymoos.com/qr-tracker';
 
 // ─── Database ─────────────────────────────────────────────────────────────────
+// Credentials komen uit .env / Hostinger-omgevingsvariabelen. Geen secrets in code.
 const pool = mysql.createPool({
-  host:     process.env.DB_HOST     || '127.0.0.1',
-  user:     process.env.DB_USER     || 'u522090863_dashboard',
-  password: process.env.DB_PASSWORD || 'Us*!UfKi6bRUYK',
-  database: process.env.DB_NAME     || 'u522090863_dashboard',
+  host:     process.env.DB_HOST || '127.0.0.1',
+  user:     process.env.DB_USER,
+  password: process.env.DB_PASSWORD,
+  database: process.env.DB_NAME,
   waitForConnections: true,
   connectionLimit: 10
 });
