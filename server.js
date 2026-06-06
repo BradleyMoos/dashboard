@@ -1,6 +1,27 @@
 const express = require('express');
 const crypto  = require('crypto');
 const path    = require('path');
+const fs      = require('fs');
+
+// ─── .env laden (zero-dependency) ───────────────────────────────────────────────
+// Leest KEY=VALUE uit dashboard/.env en zet ze in process.env (bestaande env wint).
+// Geen .env aanwezig? Dan gebeurt er niets en blijven apps op hun eigen fallback draaien.
+(function loadEnv() {
+  try {
+    const envPath = path.join(__dirname, '.env');
+    if (!fs.existsSync(envPath)) return;
+    for (const line of fs.readFileSync(envPath, 'utf8').split('\n')) {
+      const m = line.match(/^\s*([\w.-]+)\s*=\s*(.*?)\s*$/);
+      if (!m || line.trim().startsWith('#')) continue;
+      const key = m[1];
+      const val = m[2].replace(/^["']|["']$/g, '');
+      if (!(key in process.env)) process.env[key] = val;
+    }
+    console.log('.env geladen');
+  } catch (e) {
+    console.warn('.env laden mislukt:', e.message);
+  }
+})();
 
 const app = express();
 const PORT = process.env.PORT || 3000;
