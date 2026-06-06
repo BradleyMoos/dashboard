@@ -178,8 +178,25 @@ const wrap = fn => (req, res) => Promise.resolve(fn(req, res)).catch(err => {
   if (!res.headersSent) {
     res.status(500).send(page('Infra Tracker — fout',
       `<header class="top"><div><h1>Infra <span>Tracker</span></h1></div><a class="back" href="${req.baseUrl}/">← Terug</a></header>
-       <div class="msg" style="border-color:#f87171;color:#fca5a5;background:rgba(248,113,113,.12)">Er ging iets mis (mogelijk de database). Probeer het zo nog eens.</div>`));
+       <div class="msg" style="border-color:#f87171;color:#fca5a5;background:rgba(248,113,113,.12)">Er ging iets mis (mogelijk de database). Probeer het zo nog eens.</div>
+       <pre style="white-space:pre-wrap;color:#fca5a5;background:#1e222e;border:1px solid #2a2e3c;border-radius:10px;padding:1rem;font-size:.8rem;margin-top:1rem">DIAG: ${esc(err.code || '')} — ${esc(err.message || '')}</pre>`));
   }
+});
+
+// TIJDELIJKE diagnose-route — test elke DB-stap los. Verwijderen na debuggen.
+router.get('/__diag', async (req, res) => {
+  const out = [];
+  const step = async (label, fn) => {
+    try { const r = await fn(); out.push(`✓ ${label}: ${r}`); }
+    catch (e) { out.push(`✗ ${label}: [${e.code || '?'}] ${e.message}`); }
+  };
+  await step('connectie + ping', async () => { const c = await pool.getConnection(); await c.ping(); c.release(); return 'ok'; });
+  await step('SHOW TABLES LIKE infra_hosts', async () => { const [r] = await pool.query("SHOW TABLES LIKE 'infra_hosts'"); return r.length ? 'bestaat' : 'ONTBREEKT'; });
+  await step('SHOW TABLES LIKE infra_services', async () => { const [r] = await pool.query("SHOW TABLES LIKE 'infra_services'"); return r.length ? 'bestaat' : 'ONTBREEKT'; });
+  await step('SHOW COLUMNS kind', async () => { const [r] = await pool.query("SHOW COLUMNS FROM infra_hosts LIKE 'kind'"); return r.length ? 'aanwezig' : 'ONTBREEKT'; });
+  await step('COUNT hosts', async () => { const [r] = await pool.query('SELECT COUNT(*) AS n FROM infra_hosts'); return r[0].n + ' rijen'; });
+  await step('ALTER ADD COLUMN IF NOT EXISTS (test)', async () => { await pool.query("ALTER TABLE infra_hosts ADD COLUMN IF NOT EXISTS kind VARCHAR(20) DEFAULT NULL"); return 'ok'; });
+  res.type('text/plain').send(out.join('\n'));
 });
 
 router.get('/', wrap(async (req, res) => {
