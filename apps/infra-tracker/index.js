@@ -5,11 +5,12 @@ const router = express.Router();
 
 // ─── Database ─────────────────────────────────────────────────────────────────
 // Eigen tabellen met prefix `infra_` — raakt qr-tracker / b2-tracker NIET aan.
+// Credentials komen uit .env (dezelfde als qr-tracker / b2-tracker). Geen secrets in code.
 const pool = mysql.createPool({
-  host:     process.env.DB_HOST     || '127.0.0.1',
-  user:     process.env.DB_USER     || 'u522090863_dashboard',
-  password: process.env.DB_PASSWORD || 'Us*!UfKi6bRUYK',
-  database: process.env.DB_NAME     || 'u522090863_dashboard',
+  host:     process.env.DB_HOST || '127.0.0.1',
+  user:     process.env.DB_USER,
+  password: process.env.DB_PASSWORD,
+  database: process.env.DB_NAME,
   waitForConnections: true,
   connectionLimit: 5
 });
@@ -43,6 +44,12 @@ async function initDB() {
       created_at DATETIME NOT NULL
     )
   `);
+
+  // Migratie: kind-kolom (machine = EliteDesk/eigen, cloud = Hetzner). Veilig her-uitvoerbaar.
+  // DDL via query() (text-protocol), want ALTER mag niet als prepared statement.
+  await pool.query("ALTER TABLE infra_hosts ADD COLUMN IF NOT EXISTS kind VARCHAR(20) DEFAULT NULL");
+  // Eenmalige backfill: alleen rijen die nog geen kind hebben.
+  await pool.query("UPDATE infra_hosts SET kind = CASE WHEN provider LIKE '%Hetzner%' THEN 'cloud' ELSE 'machine' END WHERE kind IS NULL");
 
   // Eenmalige seed — alleen als er nog geen hosts zijn. Overschrijft nooit bewerkingen.
   const [rows] = await pool.execute('SELECT COUNT(*) AS n FROM infra_hosts');
@@ -95,9 +102,10 @@ async function seed() {
 
   for (let i = 0; i < hosts.length; i++) {
     const h = hosts[i];
+    const kind = /Hetzner/i.test(h.provider) ? 'cloud' : 'machine';
     const [r] = await pool.execute(
-      'INSERT INTO infra_hosts (name, provider, hostname, ip, location, specs, status, notes, sort_order, created_at) VALUES (?,?,?,?,?,?,?,?,?,NOW())',
-      [h.name, h.provider, h.hostname, h.ip, h.location, h.specs, h.status, h.notes, i]
+      'INSERT INTO infra_hosts (name, provider, hostname, ip, location, specs, status, notes, kind, sort_order, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,NOW())',
+      [h.name, h.provider, h.hostname, h.ip, h.location, h.specs, h.status, h.notes, kind, i]
     );
     const hostId = r.insertId;
     for (const s of h.services) {
@@ -125,6 +133,30 @@ function statusColor(status) {
     maintenance: '#f59e0b', planned: '#f59e0b',
     offline: '#f87171', stopped: '#f87171'
   })[status] || '#64748b';
+}
+
+const HOST_KINDS = [
+  { value: 'machine', label: 'EliteDesk / eigen machine' },
+  { value: 'cloud',   label: 'Hetzner / cloud server' }
+];
+
+function kindOptions(sel) {
+  return HOST_KINDS.map(k => `<option value="${k.value}"${k.value === sel ? ' selected' : ''}>${k.label}</option>`).join('');
+}
+
+function typeIcon(kind) { return kind === 'cloud' ? '☁️' : '🖥️'; }
+function typeLabel(kind) { return kind === 'cloud' ? 'Hetzner · cloud' : 'EliteDesk · eigen'; }
+
+function catIcon(cat) {
+  const c = (cat || '').toLowerCase();
+  if (c.includes('host')) return '🌐';
+  if (c.includes('cron')) return '⏰';
+  if (c.includes('monitor')) return '📊';
+  if (c.includes('platform')) return '🧱';
+  if (c.includes('net')) return '🔌';
+  if (c.includes('db') || c.includes('data')) return '🗄️';
+  if (c.includes('app')) return '📦';
+  return '⚙️';
 }
 
 function linkify(url) {
@@ -160,12 +192,12 @@ router.get('/', wrap(async (req, res) => {
 
 // ── Hosts ──
 router.post('/hosts/create', wrap(async (req, res) => {
-  const { name, provider, hostname, ip, location, specs, status, notes } = req.body;
+  const { name, provider, hostname, ip, location, specs, status, notes, kind } = req.body;
   if (!name) return res.redirect(req.baseUrl + '/?msg=' + encodeURIComponent('Naam is verplicht.'));
   const [r] = await pool.execute('SELECT COALESCE(MAX(sort_order), -1) + 1 AS n FROM infra_hosts');
   await pool.execute(
-    'INSERT INTO infra_hosts (name, provider, hostname, ip, location, specs, status, notes, sort_order, created_at) VALUES (?,?,?,?,?,?,?,?,?,NOW())',
-    [name, provider || '', hostname || '', ip || '', location || '', specs || '', status || 'online', notes || '', r[0].n]
+    'INSERT INTO infra_hosts (name, provider, hostname, ip, location, specs, status, notes, kind, sort_order, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,NOW())',
+    [name, provider || '', hostname || '', ip || '', location || '', specs || '', status || 'online', notes || '', kind || 'machine', r[0].n]
   );
   res.redirect(req.baseUrl + '/?msg=' + encodeURIComponent(`Machine "${name}" toegevoegd.`));
 }));
@@ -177,10 +209,10 @@ router.get('/hosts/:id/edit', wrap(async (req, res) => {
 }));
 
 router.post('/hosts/:id/update', wrap(async (req, res) => {
-  const { name, provider, hostname, ip, location, specs, status, notes } = req.body;
+  const { name, provider, hostname, ip, location, specs, status, notes, kind } = req.body;
   await pool.execute(
-    'UPDATE infra_hosts SET name=?, provider=?, hostname=?, ip=?, location=?, specs=?, status=?, notes=? WHERE id=?',
-    [name || '', provider || '', hostname || '', ip || '', location || '', specs || '', status || 'online', notes || '', req.params.id]
+    'UPDATE infra_hosts SET name=?, provider=?, hostname=?, ip=?, location=?, specs=?, status=?, notes=?, kind=? WHERE id=?',
+    [name || '', provider || '', hostname || '', ip || '', location || '', specs || '', status || 'online', notes || '', kind || 'machine', req.params.id]
   );
   res.redirect(req.baseUrl + '/?msg=' + encodeURIComponent('Machine bijgewerkt.'));
 }));
@@ -226,37 +258,66 @@ router.post('/services/:id/delete', wrap(async (req, res) => {
 // ─── HTML ─────────────────────────────────────────────────────────────────────
 const STYLE = `
   *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
-  :root{--bg:#0f1117;--surface:#1a1d27;--surface2:#141722;--border:#2a2d3a;--accent:#6366f1;--accent-hover:#818cf8;--text:#e2e8f0;--muted:#64748b}
-  body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:var(--bg);color:var(--text);min-height:100vh;padding:2rem 1.5rem 4rem;line-height:1.5}
-  .wrap{max-width:1000px;margin:0 auto}
-  a{color:var(--accent)}
-  header.top{display:flex;align-items:flex-end;justify-content:space-between;gap:1rem;flex-wrap:wrap;margin-bottom:.4rem}
-  header.top h1{font-size:1.6rem;font-weight:700;letter-spacing:-.02em}
-  header.top h1 span{color:var(--accent)}
-  .back{font-size:.8rem;color:var(--muted);text-decoration:none}
-  .back:hover{color:var(--text)}
-  .sub{color:var(--muted);font-size:.875rem;margin-bottom:1.5rem}
+  :root{--bg:#0e1015;--surface:#171a23;--surface2:#1e222e;--border:#2a2e3c;--accent:#6366f1;--accent-hover:#818cf8;--text:#e6e9f0;--muted:#7c869b;--green:#22c55e;--amber:#f59e0b;--red:#f87171}
+  body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:radial-gradient(1100px 560px at 82% -12%,rgba(99,102,241,.10),transparent 60%),var(--bg);color:var(--text);min-height:100vh;padding:2.2rem 1.5rem 5rem;line-height:1.55}
+  .wrap{max-width:1100px;margin:0 auto}
+  a{color:var(--accent-hover);text-decoration:none}
+  a:hover{text-decoration:underline}
+  header.top{display:flex;align-items:center;justify-content:space-between;gap:1rem;flex-wrap:wrap;margin-bottom:.3rem}
+  .brand{display:flex;align-items:center;gap:.75rem}
+  .brand .logo{width:42px;height:42px;border-radius:12px;display:grid;place-items:center;font-size:1.35rem;background:linear-gradient(135deg,var(--accent),#a855f7);box-shadow:0 6px 18px rgba(99,102,241,.35)}
+  .brand h1{font-size:1.5rem;font-weight:800;letter-spacing:-.02em}
+  .brand h1 span{color:var(--accent-hover)}
+  .back{font-size:.82rem;color:var(--muted)}
+  .back:hover{color:var(--text);text-decoration:none}
+  .sub{color:var(--muted);font-size:.9rem;margin:.15rem 0 1.4rem}
   .msg{background:rgba(99,102,241,.12);border:1px solid var(--accent);color:#c7d2fe;padding:.7rem 1rem;border-radius:10px;margin-bottom:1.25rem;font-size:.875rem}
-  .host{background:var(--surface);border:1px solid var(--border);border-radius:14px;padding:1.25rem 1.4rem;margin-bottom:1.25rem}
-  .host-head{display:flex;align-items:flex-start;justify-content:space-between;gap:1rem;flex-wrap:wrap}
-  .host-title{display:flex;align-items:center;gap:.6rem;flex-wrap:wrap}
-  .host-title h2{font-size:1.15rem;font-weight:700}
-  .meta{color:var(--muted);font-size:.8rem;margin-top:.35rem;display:flex;flex-wrap:wrap;gap:.25rem 1rem}
-  .meta code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;color:#94a3b8}
-  .host-notes{color:var(--muted);font-size:.82rem;margin-top:.5rem;font-style:italic}
-  .pill{display:inline-flex;align-items:center;gap:.35rem;font-size:.68rem;font-weight:700;text-transform:uppercase;letter-spacing:.05em;padding:.22rem .55rem;border-radius:99px}
+  .stats{display:flex;gap:.8rem;flex-wrap:wrap;margin-bottom:1.9rem}
+  .stat{flex:1;min-width:120px;background:linear-gradient(180deg,var(--surface),#13161f);border:1px solid var(--border);border-radius:14px;padding:.85rem 1.1rem}
+  .stat .n{font-size:1.55rem;font-weight:800;letter-spacing:-.02em}
+  .stat .l{font-size:.7rem;color:var(--muted);text-transform:uppercase;letter-spacing:.06em;margin-top:.1rem}
+  .section{margin:0 0 2.1rem}
+  .section-head{display:flex;align-items:center;gap:.7rem;margin:0 0 1rem}
+  .section-head .ico{width:36px;height:36px;border-radius:10px;display:grid;place-items:center;font-size:1.15rem;background:var(--surface2);border:1px solid var(--border)}
+  .section-head .t{font-size:1.08rem;font-weight:750;letter-spacing:-.01em}
+  .section-head .s{font-size:.78rem;color:var(--muted)}
+  .section-head .count{margin-left:auto;font-size:.72rem;font-weight:700;color:var(--muted);background:var(--surface);border:1px solid var(--border);border-radius:99px;padding:.25rem .65rem}
+  .hosts{display:grid;grid-template-columns:repeat(auto-fill,minmax(440px,1fr));gap:1.1rem}
+  @media(max-width:560px){.hosts{grid-template-columns:1fr}}
+  .host{position:relative;background:linear-gradient(180deg,var(--surface),#13161f);border:1px solid var(--border);border-radius:16px;padding:1.2rem 1.25rem 1.1rem;overflow:hidden;transition:border-color .15s,transform .15s,box-shadow .15s}
+  .host:hover{border-color:#3a3f52;box-shadow:0 10px 30px rgba(0,0,0,.25)}
+  .host::before{content:"";position:absolute;top:0;left:0;right:0;height:3px;background:linear-gradient(90deg,var(--c,#6366f1),transparent 75%)}
+  .host-head{display:flex;align-items:flex-start;gap:.8rem}
+  .host-ico{width:46px;height:46px;flex:none;border-radius:13px;display:grid;place-items:center;font-size:1.35rem;background:var(--surface2);border:1px solid var(--border)}
+  .host-id{flex:1;min-width:0}
+  .host-id h2{font-size:1.12rem;font-weight:750;display:flex;align-items:center;gap:.5rem;flex-wrap:wrap;letter-spacing:-.01em}
+  .type-tag{font-size:.64rem;font-weight:700;text-transform:uppercase;letter-spacing:.05em;color:#aeb6c8;background:var(--surface2);border:1px solid var(--border);border-radius:6px;padding:.14rem .42rem}
+  .host-actions{display:flex;gap:.35rem;flex:none}
+  .pill{display:inline-flex;align-items:center;gap:.35rem;font-size:.66rem;font-weight:700;text-transform:uppercase;letter-spacing:.05em;padding:.2rem .55rem;border-radius:99px}
   .pill::before{content:"";width:6px;height:6px;border-radius:50%;background:currentColor;display:block}
-  table{width:100%;border-collapse:collapse;margin-top:1rem;font-size:.85rem}
-  th{text-align:left;color:var(--muted);font-weight:600;font-size:.7rem;text-transform:uppercase;letter-spacing:.05em;padding:.4rem .5rem;border-bottom:1px solid var(--border)}
-  td{padding:.55rem .5rem;border-bottom:1px solid var(--border);vertical-align:top}
-  tr:last-child td{border-bottom:none}
-  .svc-name{font-weight:600;color:var(--text)}
-  .svc-cat{display:inline-block;font-size:.68rem;color:#94a3b8;background:var(--surface2);border:1px solid var(--border);border-radius:6px;padding:.1rem .4rem;margin-top:.2rem}
-  .svc-notes{color:var(--muted);font-size:.78rem;margin-top:.25rem}
-  .row-actions{white-space:nowrap;text-align:right}
-  .empty{color:var(--muted);font-size:.82rem;font-style:italic;margin-top:.75rem}
-  details{margin-top:1rem;border-top:1px dashed var(--border);padding-top:.9rem}
-  summary{cursor:pointer;color:var(--accent);font-size:.82rem;font-weight:600;list-style:none}
+  .chips{display:flex;flex-wrap:wrap;gap:.35rem;margin-top:.6rem;align-items:center}
+  .chip{font-size:.72rem;color:#aeb6c8;background:var(--surface2);border:1px solid var(--border);border-radius:7px;padding:.18rem .5rem;display:inline-flex;gap:.3rem;align-items:center}
+  .chip code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;color:#cbd2e0;font-size:.72rem}
+  .host-notes{color:var(--muted);font-size:.8rem;margin-top:.6rem;line-height:1.45}
+  .svc-label{font-size:.68rem;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);margin:1.05rem 0 .6rem;font-weight:700}
+  .svcs{display:grid;grid-template-columns:repeat(auto-fill,minmax(168px,1fr));gap:.6rem}
+  .svc{position:relative;background:var(--surface2);border:1px solid var(--border);border-radius:11px;padding:.65rem .7rem;transition:border-color .15s,transform .15s}
+  .svc:hover{border-color:var(--accent);transform:translateY(-1px)}
+  .svc-top{display:flex;align-items:center;gap:.4rem;margin-bottom:.35rem}
+  .svc-ico{font-size:1rem;line-height:1}
+  .dot{width:8px;height:8px;border-radius:50%;flex:none}
+  .svc-actions{margin-left:auto;display:flex;gap:.2rem;opacity:0;transition:opacity .15s}
+  .svc:hover .svc-actions{opacity:1}
+  .icon-btn{width:23px;height:23px;border-radius:6px;display:grid;place-items:center;border:1px solid var(--border);background:var(--bg);color:var(--muted);font-size:.72rem;line-height:1;cursor:pointer;text-decoration:none;padding:0}
+  .icon-btn:hover{color:var(--text);border-color:var(--accent);text-decoration:none}
+  .icon-btn.del:hover{color:var(--red);border-color:var(--red)}
+  .svc-name{font-weight:650;font-size:.85rem;line-height:1.3;word-break:break-word}
+  .svc-cat{font-size:.68rem;color:var(--muted);margin-top:.15rem}
+  .svc-url{font-size:.72rem;margin-top:.3rem;word-break:break-all}
+  .svc-notes{font-size:.72rem;color:var(--muted);margin-top:.3rem;line-height:1.4}
+  .svc-empty{grid-column:1/-1;color:var(--muted);font-size:.8rem;font-style:italic}
+  details.add{margin-top:.95rem;border-top:1px dashed var(--border);padding-top:.75rem}
+  summary{cursor:pointer;color:var(--accent-hover);font-size:.8rem;font-weight:600;list-style:none}
   summary::-webkit-details-marker{display:none}
   summary::before{content:"+ ";font-weight:700}
   .form-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:.6rem;margin-top:.8rem}
@@ -266,15 +327,11 @@ const STYLE = `
   textarea{min-height:60px;resize:vertical}
   .full{grid-column:1/-1}
   .btn{display:inline-block;padding:.5rem .9rem;background:var(--accent);color:#fff;border:none;border-radius:8px;font-size:.82rem;font-weight:600;cursor:pointer;text-decoration:none}
-  .btn:hover{background:var(--accent-hover)}
-  .btn-sm{padding:.3rem .6rem;font-size:.75rem}
+  .btn:hover{background:var(--accent-hover);text-decoration:none}
   .btn-ghost{background:transparent;border:1px solid var(--border);color:#94a3b8}
   .btn-ghost:hover{background:var(--surface2);color:var(--text)}
-  .btn-danger{background:transparent;border:1px solid rgba(248,113,113,.4);color:#f87171}
-  .btn-danger:hover{background:rgba(248,113,113,.12)}
-  .add-host{background:var(--surface);border:1px dashed var(--border);border-radius:14px;padding:1.25rem 1.4rem;margin-top:1.5rem}
-  .add-host h3{font-size:1rem;margin-bottom:.2rem}
-  .edit-card{background:var(--surface);border:1px solid var(--border);border-radius:14px;padding:1.5rem;max-width:640px}
+  .add-host{background:linear-gradient(180deg,var(--surface),#13161f);border:1px dashed var(--border);border-radius:16px;padding:1.2rem 1.4rem;margin-top:.5rem}
+  .edit-card{background:linear-gradient(180deg,var(--surface),#13161f);border:1px solid var(--border);border-radius:16px;padding:1.6rem;max-width:660px}
   .actions{display:flex;gap:.5rem;margin-top:1rem;flex-wrap:wrap}
 `;
 
@@ -294,59 +351,58 @@ function statusOptions(list, selected) {
   return list.map(s => `<option value="${s}"${s === selected ? ' selected' : ''}>${s}</option>`).join('');
 }
 
-function overviewPage(base, hosts, byHost, msg) {
-  const hostBlocks = hosts.map(h => {
-    const services = byHost[h.id] || [];
-    const rows = services.map(s => `
-      <tr>
-        <td>
-          <div class="svc-name">${esc(s.name)}</div>
-          ${s.category ? `<span class="svc-cat">${esc(s.category)}</span>` : ''}
-          ${s.notes ? `<div class="svc-notes">${esc(s.notes)}</div>` : ''}
-        </td>
-        <td>${s.url ? linkify(s.url) : '<span style="color:var(--muted)">—</span>'}${s.port ? `<div class="svc-notes">poort ${esc(s.port)}</div>` : ''}</td>
-        <td>${statusPill(s.status)}</td>
-        <td class="row-actions">
-          <a class="btn btn-sm btn-ghost" href="${base}/services/${s.id}/edit">Bewerk</a>
-          <form method="POST" action="${base}/services/${s.id}/delete" style="display:inline" onsubmit="return confirm('Service verwijderen?')">
-            <button class="btn btn-sm btn-danger" type="submit">×</button>
+function renderService(base, s) {
+  return `
+    <div class="svc">
+      <div class="svc-top">
+        <span class="svc-ico">${catIcon(s.category)}</span>
+        <span class="dot" style="background:${statusColor(s.status)}" title="${esc(s.status)}"></span>
+        <span class="svc-actions">
+          <a class="icon-btn" href="${base}/services/${s.id}/edit" title="Bewerk">✎</a>
+          <form method="POST" action="${base}/services/${s.id}/delete" onsubmit="return confirm('Service verwijderen?')">
+            <button class="icon-btn del" type="submit" title="Verwijder">×</button>
           </form>
-        </td>
-      </tr>`).join('');
+        </span>
+      </div>
+      <div class="svc-name">${esc(s.name)}</div>
+      ${s.category ? `<div class="svc-cat">${esc(s.category)}</div>` : ''}
+      ${s.url ? `<div class="svc-url">${linkify(s.url)}</div>` : ''}
+      ${s.port ? `<div class="svc-cat">poort ${esc(s.port)}</div>` : ''}
+      ${s.notes ? `<div class="svc-notes">${esc(s.notes)}</div>` : ''}
+    </div>`;
+}
 
-    const table = services.length ? `
-      <table>
-        <thead><tr><th>Service / app</th><th>URL</th><th>Status</th><th></th></tr></thead>
-        <tbody>${rows}</tbody>
-      </table>` : `<p class="empty">Nog geen services op deze machine.</p>`;
+function renderHost(base, h, services) {
+  const chips = [
+    h.provider ? `<span class="chip">${esc(h.provider)}</span>` : '',
+    h.specs ? `<span class="chip">⚙️ ${esc(h.specs)}</span>` : '',
+    h.hostname ? `<span class="chip">host <code>${esc(h.hostname)}</code></span>` : '',
+    h.ip ? `<span class="chip">IP <code>${esc(h.ip)}</code></span>` : '',
+    h.location ? `<span class="chip">📍 ${esc(h.location)}</span>` : ''
+  ].join('');
 
-    return `
-    <section class="host">
+  return `
+    <article class="host" style="--c:${statusColor(h.status)}">
       <div class="host-head">
-        <div>
-          <div class="host-title">
-            <h2>${esc(h.name)}</h2>
-            ${statusPill(h.status)}
-          </div>
-          <div class="meta">
-            ${h.provider ? `<span>${esc(h.provider)}</span>` : ''}
-            ${h.specs ? `<span>${esc(h.specs)}</span>` : ''}
-            ${h.hostname ? `<span>host: <code>${esc(h.hostname)}</code></span>` : ''}
-            ${h.ip ? `<span>IP: <code>${esc(h.ip)}</code></span>` : ''}
-            ${h.location ? `<span>📍 ${esc(h.location)}</span>` : ''}
-          </div>
+        <div class="host-ico">${typeIcon(h.kind)}</div>
+        <div class="host-id">
+          <h2>${esc(h.name)} <span class="type-tag">${typeLabel(h.kind)}</span></h2>
+          <div class="chips">${statusPill(h.status)}${chips}</div>
           ${h.notes ? `<div class="host-notes">${esc(h.notes)}</div>` : ''}
         </div>
-        <div class="row-actions">
-          <a class="btn btn-sm btn-ghost" href="${base}/hosts/${h.id}/edit">Bewerk machine</a>
-          <form method="POST" action="${base}/hosts/${h.id}/delete" style="display:inline" onsubmit="return confirm('Hele machine + alle services verwijderen?')">
-            <button class="btn btn-sm btn-danger" type="submit">Verwijder</button>
+        <div class="host-actions">
+          <a class="icon-btn" href="${base}/hosts/${h.id}/edit" title="Bewerk machine">✎</a>
+          <form method="POST" action="${base}/hosts/${h.id}/delete" onsubmit="return confirm('Hele machine + alle services verwijderen?')">
+            <button class="icon-btn del" type="submit" title="Verwijder machine">×</button>
           </form>
         </div>
       </div>
-      ${table}
-      <details>
-        <summary>Service toevoegen aan ${esc(h.name)}</summary>
+      <div class="svc-label">Draait hierop · ${services.length}</div>
+      <div class="svcs">
+        ${services.length ? services.map(s => renderService(base, s)).join('') : '<div class="svc-empty">Nog niets toegevoegd.</div>'}
+      </div>
+      <details class="add">
+        <summary>Service toevoegen</summary>
         <form method="POST" action="${base}/services/create">
           <input type="hidden" name="host_id" value="${h.id}">
           <div class="form-grid">
@@ -360,6 +416,38 @@ function overviewPage(base, hosts, byHost, msg) {
           <div class="actions"><button class="btn" type="submit">Service opslaan</button></div>
         </form>
       </details>
+    </article>`;
+}
+
+function overviewPage(base, hosts, byHost, msg) {
+  const allServices = Object.values(byHost).flat();
+  const totalSvc = allServices.length;
+  const running = allServices.filter(s => s.status === 'running').length;
+  const planned = allServices.filter(s => s.status === 'planned').length;
+
+  const groupMeta = {
+    machine: { icon: '🖥️', t: 'EliteDesk machines', s: 'Eigen mini-PC’s thuis' },
+    cloud:   { icon: '☁️', t: 'Hetzner servers',   s: 'Cloud (CPX)' }
+  };
+  const order = ['machine', 'cloud'];
+
+  const byKind = {};
+  for (const h of hosts) {
+    const k = order.includes(h.kind) ? h.kind : 'machine';
+    (byKind[k] ||= []).push(h);
+  }
+
+  const sections = order.filter(k => byKind[k]?.length).map(k => {
+    const m = groupMeta[k];
+    const n = byKind[k].length;
+    return `
+    <section class="section">
+      <div class="section-head">
+        <div class="ico">${m.icon}</div>
+        <div><div class="t">${m.t}</div><div class="s">${m.s}</div></div>
+        <div class="count">${n} machine${n === 1 ? '' : 's'}</div>
+      </div>
+      <div class="hosts">${byKind[k].map(h => renderHost(base, h, byHost[h.id] || [])).join('')}</div>
     </section>`;
   }).join('');
 
@@ -370,6 +458,7 @@ function overviewPage(base, hosts, byHost, msg) {
         <form method="POST" action="${base}/hosts/create">
           <div class="form-grid">
             <div><label>Naam *</label><input name="name" required placeholder="bv. 800G5"></div>
+            <div><label>Type</label><select name="kind">${kindOptions('machine')}</select></div>
             <div><label>Provider</label><input name="provider" placeholder="Hetzner / Eigen hardware"></div>
             <div><label>Hostname</label><input name="hostname" placeholder="my-host"></div>
             <div><label>IP / Tailscale</label><input name="ip" placeholder="100.x.x.x"></div>
@@ -385,14 +474,18 @@ function overviewPage(base, hosts, byHost, msg) {
 
   const body = `
     <header class="top">
-      <div>
-        <h1>Infra <span>Tracker</span></h1>
-      </div>
-      <a class="back" href="/">← Terug naar dashboard</a>
+      <div class="brand"><div class="logo">🖥️</div><div><h1>Infra <span>Tracker</span></h1></div></div>
+      <a class="back" href="/">← Dashboard</a>
     </header>
     <p class="sub">Per machine bijhouden welke services &amp; apps er draaien.</p>
     ${msg ? `<div class="msg">${esc(msg)}</div>` : ''}
-    ${hosts.length ? hostBlocks : '<p class="empty">Nog geen machines. Voeg er hieronder een toe.</p>'}
+    <div class="stats">
+      <div class="stat"><div class="n">${hosts.length}</div><div class="l">Machines</div></div>
+      <div class="stat"><div class="n">${totalSvc}</div><div class="l">Services</div></div>
+      <div class="stat"><div class="n">${running}</div><div class="l">Actief</div></div>
+      <div class="stat"><div class="n">${planned}</div><div class="l">Gepland</div></div>
+    </div>
+    ${hosts.length ? sections : '<p class="svc-empty">Nog geen machines. Voeg er hieronder een toe.</p>'}
     ${addHost}`;
 
   return page('Infra Tracker — Bradley Moos', body);
@@ -406,6 +499,7 @@ function hostEditPage(base, h) {
       <form method="POST" action="${base}/hosts/${h.id}/update">
         <div class="form-grid">
           <div><label>Naam *</label><input name="name" required value="${esc(h.name)}"></div>
+          <div><label>Type</label><select name="kind">${kindOptions(h.kind || 'machine')}</select></div>
           <div><label>Provider</label><input name="provider" value="${esc(h.provider)}"></div>
           <div><label>Hostname</label><input name="hostname" value="${esc(h.hostname)}"></div>
           <div><label>IP / Tailscale</label><input name="ip" value="${esc(h.ip)}"></div>
